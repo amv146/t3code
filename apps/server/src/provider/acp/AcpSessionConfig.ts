@@ -17,6 +17,15 @@ import type { AcpSessionModeState } from "./AcpRuntimeModel.ts";
 /** Synthetic descriptor ID for agents that expose modes outside config options. */
 export const ACP_SESSION_MODE_OPTION_ID = "_t3/session-mode";
 
+const ACP_OPTION_VALUE_PREFIX = "__acp_default__";
+
+// Escape native values that use the prefix too, so they cannot collide with the empty choice.
+export function encodeAcpOptionValue(value: string): string {
+  return value === "" || value.startsWith(ACP_OPTION_VALUE_PREFIX)
+    ? `${ACP_OPTION_VALUE_PREFIX}${value}`
+    : value;
+}
+
 const MAX_OPTION_DESCRIPTORS = 16;
 const MAX_OPTION_CHOICES = 64;
 const MAX_TEXT_LENGTH = 256;
@@ -44,13 +53,19 @@ function selectChoices(
   const seen = new Set<string>();
   const choices: Array<ProviderOptionChoice> = [];
   for (const candidate of candidates) {
-    const id = boundedOpaqueValue(candidate.value, MAX_TEXT_LENGTH);
-    if (id === undefined || seen.has(id)) continue;
+    if (
+      candidate.value !== "" &&
+      boundedOpaqueValue(candidate.value, MAX_TEXT_LENGTH) === undefined
+    ) {
+      continue;
+    }
+    const id = encodeAcpOptionValue(candidate.value);
+    if (seen.has(id)) continue;
     seen.add(id);
     const description = boundedText(candidate.description, MAX_DESCRIPTION_LENGTH);
     choices.push({
       id,
-      label: boundedText(candidate.name, MAX_TEXT_LENGTH) || id,
+      label: boundedText(candidate.name, MAX_TEXT_LENGTH) || candidate.value || "Default",
       ...(description ? { description } : {}),
     });
     if (choices.length === MAX_OPTION_CHOICES) break;
@@ -101,14 +116,12 @@ export function acpProviderOptionDescriptors(input: {
     if (option.category === "thought_level") {
       mirroredModeChoiceSets.push(new Set(choices.map((choice) => choice.id)));
     }
-    const currentValue = option.currentValue;
+    const currentValue = encodeAcpOptionValue(option.currentValue);
     descriptors.push({
       ...base,
       type: "select",
       options: choices,
-      ...(currentValue && choices.some((choice) => choice.id === currentValue)
-        ? { currentValue }
-        : {}),
+      ...(choices.some((choice) => choice.id === currentValue) ? { currentValue } : {}),
     });
     if (descriptors.length === MAX_OPTION_DESCRIPTORS) return descriptors;
   }
@@ -122,7 +135,7 @@ export function acpProviderOptionDescriptors(input: {
         description: mode.description,
       })),
     );
-    const currentValue = modeState.currentModeId;
+    const currentValue = encodeAcpOptionValue(modeState.currentModeId);
     // Some agents mirror one knob through both the modes API and a config
     // option (codex-acp advertises its thinking levels as modes too). Skip
     // the synthetic descriptor when an existing descriptor already exposes
@@ -142,9 +155,7 @@ export function acpProviderOptionDescriptors(input: {
         description: "Session mode advertised by the ACP agent.",
         type: "select",
         options: choices,
-        ...(currentValue && choices.some((choice) => choice.id === currentValue)
-          ? { currentValue }
-          : {}),
+        ...(choices.some((choice) => choice.id === currentValue) ? { currentValue } : {}),
       });
     }
   }

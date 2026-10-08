@@ -1,8 +1,48 @@
 import { describe, expect, it } from "@effect/vitest";
+import { ModelCapabilities } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 import { ACP_SESSION_MODE_OPTION_ID, acpProviderOptionDescriptors } from "./AcpSessionConfig.ts";
 
+const decodeCapabilities = Schema.decodeUnknownSync(ModelCapabilities);
+
 describe("acpProviderOptionDescriptors", () => {
+  it("represents empty agent choices with a nonempty sentinel through the contract", () => {
+    const descriptors = acpProviderOptionDescriptors({
+      configOptions: [
+        {
+          id: "agent",
+          name: "Selection",
+          type: "select",
+          currentValue: "",
+          options: [
+            { value: "", name: "Provider default" },
+            { value: "custom", name: "Custom" },
+          ],
+        },
+      ],
+      modeState: undefined,
+    });
+    expect(
+      decodeCapabilities({
+        optionDescriptors: descriptors,
+      }),
+    ).toEqual({
+      optionDescriptors: [
+        {
+          id: "agent",
+          label: "Selection",
+          type: "select",
+          currentValue: "__acp_default__",
+          options: [
+            { id: "__acp_default__", label: "Provider default" },
+            { id: "custom", label: "Custom" },
+          ],
+        },
+      ],
+    });
+  });
+
   it("maps non-model select options and excludes model and collaboration categories", () => {
     const descriptors = acpProviderOptionDescriptors({
       configOptions: [
@@ -79,7 +119,7 @@ describe("acpProviderOptionDescriptors", () => {
     ]);
   });
 
-  it("flattens grouped select choices and drops empty or duplicate values", () => {
+  it("flattens grouped select choices and drops duplicate and blank values", () => {
     const descriptors = acpProviderOptionDescriptors({
       configOptions: [
         {
@@ -207,8 +247,8 @@ describe("acpProviderOptionDescriptors", () => {
     ]);
   });
 
-  it("preserves canonical opaque option values and omits values the wire would mutate", () => {
-    const exactValue = "value:with:opaque-markers";
+  it("escapes sentinel collisions, rejects invalid values, and supplies nonempty labels", () => {
+    const exactValue = "__acp_default__";
     const descriptors = acpProviderOptionDescriptors({
       configOptions: [
         {
@@ -218,7 +258,9 @@ describe("acpProviderOptionDescriptors", () => {
           currentValue: exactValue,
           options: [
             { value: exactValue, name: "Exact" },
-            { value: " value with spaces ", name: "Would be trimmed" },
+            { value: `${exactValue}${exactValue}`, name: "Repeated prefix" },
+            { value: " value with spaces ", name: "Padded" },
+            { value: "", name: " " },
             { value: "x".repeat(257), name: "Too long" },
           ],
         },
@@ -228,8 +270,12 @@ describe("acpProviderOptionDescriptors", () => {
 
     expect(descriptors[0]).toMatchObject({
       id: "opaque",
-      currentValue: exactValue,
-      options: [{ id: exactValue, label: "Exact" }],
+      currentValue: `${exactValue}${exactValue}`,
+      options: [
+        { id: `${exactValue}${exactValue}`, label: "Exact" },
+        { id: `${exactValue}${exactValue}${exactValue}`, label: "Repeated prefix" },
+        { id: exactValue, label: "Default" },
+      ],
     });
   });
 
