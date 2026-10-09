@@ -31,7 +31,8 @@ function model(input: {
 }
 
 describe("getProviderModelCapabilities", () => {
-  it.each(["__acp_default__", "plan", undefined])(
+  const acpDefaultValue = "__acp_default__".padEnd(257, "_");
+  it.each([acpDefaultValue, "plan", undefined])(
     "preserves ACP agent choices and current value %j when plan mode is disabled",
     (currentValue) => {
       const models = [
@@ -46,7 +47,7 @@ describe("getProviderModelCapabilities", () => {
                 ...(currentValue !== undefined ? { currentValue } : {}),
                 options: [
                   { id: "custom", label: "Custom" },
-                  { id: "__acp_default__", label: "Provider default" },
+                  { id: acpDefaultValue, label: "Provider default" },
                   { id: "plan", label: "Plan" },
                 ],
               },

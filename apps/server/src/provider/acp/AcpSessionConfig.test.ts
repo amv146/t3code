@@ -5,6 +5,7 @@ import * as Schema from "effect/Schema";
 import { ACP_SESSION_MODE_OPTION_ID, acpProviderOptionDescriptors } from "./AcpSessionConfig.ts";
 
 const decodeCapabilities = Schema.decodeUnknownSync(ModelCapabilities);
+const emptyValue = "__acp_default__".padEnd(257, "_");
 
 describe("acpProviderOptionDescriptors", () => {
   it("represents empty agent choices with a nonempty sentinel through the contract", () => {
@@ -33,9 +34,9 @@ describe("acpProviderOptionDescriptors", () => {
           id: "agent",
           label: "Selection",
           type: "select",
-          currentValue: "__acp_default__",
+          currentValue: emptyValue,
           options: [
-            { id: "__acp_default__", label: "Provider default" },
+            { id: emptyValue, label: "Provider default" },
             { id: "custom", label: "Custom" },
           ],
         },
@@ -191,6 +192,43 @@ describe("acpProviderOptionDescriptors", () => {
     ]);
   });
 
+  it.each([
+    { currentModeId: "", currentValue: emptyValue },
+    { currentModeId: "__acp_default__", currentValue: "__acp_default__" },
+    {
+      currentModeId: "__acp_default__".padEnd(256, "_"),
+      currentValue: "__acp_default__".padEnd(256, "_"),
+    },
+  ])("keeps empty and legacy session modes distinct for $currentModeId", (selection) => {
+    const descriptors = acpProviderOptionDescriptors({
+      configOptions: [],
+      modeState: {
+        currentModeId: selection.currentModeId,
+        availableModes: [
+          { id: "", name: "Provider default" },
+          { id: "__acp_default__", name: "Literal value" },
+          { id: "__acp_default__".padEnd(256, "_"), name: "Longest legacy value" },
+          { id: emptyValue, name: "Too long" },
+        ],
+      },
+    });
+
+    expect(decodeCapabilities({ optionDescriptors: descriptors }).optionDescriptors).toEqual([
+      {
+        id: ACP_SESSION_MODE_OPTION_ID,
+        label: "Mode",
+        description: "Session mode advertised by the ACP agent.",
+        type: "select",
+        currentValue: selection.currentValue,
+        options: [
+          { id: emptyValue, label: "Provider default" },
+          { id: "__acp_default__", label: "Literal value" },
+          { id: "__acp_default__".padEnd(256, "_"), label: "Longest legacy value" },
+        ],
+      },
+    ]);
+  });
+
   it("suppresses the synthetic mode descriptor when modes duplicate a config option", () => {
     const descriptors = acpProviderOptionDescriptors({
       configOptions: [
@@ -247,8 +285,9 @@ describe("acpProviderOptionDescriptors", () => {
     ]);
   });
 
-  it("escapes sentinel collisions, rejects invalid values, and supplies nonempty labels", () => {
+  it("preserves legacy sentinel-like values and rejects invalid choices", () => {
     const exactValue = "__acp_default__";
+    const longestLegacyValue = exactValue.padEnd(256, "_");
     const descriptors = acpProviderOptionDescriptors({
       configOptions: [
         {
@@ -259,9 +298,10 @@ describe("acpProviderOptionDescriptors", () => {
           options: [
             { value: exactValue, name: "Exact" },
             { value: `${exactValue}${exactValue}`, name: "Repeated prefix" },
+            { value: longestLegacyValue, name: "Longest legacy value" },
             { value: " value with spaces ", name: "Padded" },
             { value: "", name: " " },
-            { value: "x".repeat(257), name: "Too long" },
+            { value: emptyValue, name: "Too long" },
           ],
         },
       ],
@@ -270,11 +310,12 @@ describe("acpProviderOptionDescriptors", () => {
 
     expect(descriptors[0]).toMatchObject({
       id: "opaque",
-      currentValue: `${exactValue}${exactValue}`,
+      currentValue: exactValue,
       options: [
-        { id: `${exactValue}${exactValue}`, label: "Exact" },
-        { id: `${exactValue}${exactValue}${exactValue}`, label: "Repeated prefix" },
-        { id: exactValue, label: "Default" },
+        { id: exactValue, label: "Exact" },
+        { id: `${exactValue}${exactValue}`, label: "Repeated prefix" },
+        { id: longestLegacyValue, label: "Longest legacy value" },
+        { id: emptyValue, label: "Default" },
       ],
     });
   });

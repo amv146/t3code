@@ -3250,7 +3250,7 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
-  it.live("decodes ACP sentinels without confusing empty and literal values", () =>
+  it.live("decodes ACP sentinels without changing persisted legacy values", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;
       const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
@@ -3297,7 +3297,7 @@ describe("AcpAdapterV2", () => {
       const modelSelection = {
         instanceId,
         model: "default",
-        options: [{ id: "profile", value: "custom" }],
+        options: [{ id: "profile", value: "__acp_default__" }],
       } satisfies ModelSelection;
       const runtime = yield* adapter.openSession({
         threadId,
@@ -3310,12 +3310,14 @@ describe("AcpAdapterV2", () => {
         modelSelection,
         runtimePolicy,
       });
-      assert.equal(currentLabel, "Custom");
+      assert.equal(currentLabel, "Literal value");
 
       const requestedValues = [
         { value: "", label: "Provider default" },
+        { value: "custom", label: "Custom" },
         { value: "__acp_default__", label: "Literal value" },
         { value: "__acp_default____acp_default__", label: "Repeated prefix" },
+        { value: "__acp_default__".padEnd(256, "_"), label: "Longest legacy value" },
         { value: "", label: "Provider default" },
       ];
       for (const [index, { value, label }] of requestedValues.entries()) {
@@ -3348,7 +3350,7 @@ describe("AcpAdapterV2", () => {
       );
       assert.deepEqual(
         requests.map((event) => rawProtocolRequestParam(event, "value")),
-        ["custom", ...requestedValues.map(({ value }) => value)],
+        ["__acp_default__", ...requestedValues.map(({ value }) => value)],
       );
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );

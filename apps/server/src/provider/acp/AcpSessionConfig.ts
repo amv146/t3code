@@ -17,7 +17,9 @@ import type { AcpSessionModeState } from "./AcpRuntimeModel.ts";
 /** Synthetic descriptor ID for agents that expose modes outside config options. */
 export const ACP_SESSION_MODE_OPTION_ID = "_t3/session-mode";
 
-const ACP_OPTION_VALUE_PREFIX = "__acp_default__";
+// Legacy ACP values were limited to 256 characters. Keep the marker outside
+// that range so a previously saved native value cannot become the empty choice.
+const ACP_OPTION_VALUE_PREFIX = "__acp_default__".padEnd(257, "_");
 
 // Escape native values that use the prefix too, so they cannot collide with the empty choice.
 export function encodeAcpOptionValue(value: string): string {

@@ -328,6 +328,7 @@ function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
               { value: "custom", name: "Custom" },
               { value: "__acp_default__", name: "Literal value" },
               { value: "__acp_default____acp_default__", name: "Repeated prefix" },
+              { value: "__acp_default__".padEnd(256, "_"), name: "Longest legacy value" },
             ],
           },
         ]
