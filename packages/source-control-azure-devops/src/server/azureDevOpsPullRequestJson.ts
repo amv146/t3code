@@ -8,8 +8,6 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import type {
   PullRequestActor,
-  PullRequestCheck,
-  PullRequestCheckStatus,
   PullRequestComment,
   PullRequestMergeMethod,
   PullRequestMergeability,
@@ -328,262 +326,6 @@ export function decodeThreadsJson(
   );
 }
 
-/** Azure's well-known policy type ids for the policies its Checks list shows. */
-const BUILD_POLICY_TYPE_ID = "0609b952-1397-4640-95ec-e00a01b2c241";
-const STATUS_POLICY_TYPE_ID = "cbdc66da-9728-4af8-aada-9a5a32e4a226";
-const COMMENT_POLICY_TYPE_ID = "c6a1889d-b943-4856-b76f-9e46bb6b0df2";
-
-const RawPullRequestStatusSchema = Schema.Struct({
-  id: Schema.Number,
-  state: Schema.optional(Schema.NullOr(Schema.String)),
-  description: Schema.optional(Schema.NullOr(Schema.String)),
-  targetUrl: Schema.optional(Schema.NullOr(Schema.String)),
-  context: Schema.optional(
-    Schema.NullOr(
-      Schema.Struct({
-        genre: Schema.optional(Schema.NullOr(Schema.String)),
-        name: Schema.optional(Schema.NullOr(Schema.String)),
-      }),
-    ),
-  ),
-});
-
-/** A status an external service posted on a pull request, as Azure's Checks list reads it. */
-export interface AzureDevOpsPullRequestStatus {
-  readonly id: number;
-  readonly key: string;
-  readonly state: string | null;
-  readonly description: string | null;
-  readonly url: string | null;
-}
-
-const decodePullRequestStatusEntry = Schema.decodeUnknownExit(RawPullRequestStatusSchema);
-
-/** Statuses carry relative links such as `?_a=…` for in-page tabs, which lead nowhere here. */
-function absoluteUrl(value: string | null | undefined): string | null {
-  const url = trimmed(value);
-  return url !== null && /^https?:\/\//i.test(url) ? url : null;
-}
-
-export function decodePullRequestStatusesJson(
-  raw: string,
-): Result.Result<ReadonlyArray<AzureDevOpsPullRequestStatus>, DecodeFailure> {
-  const decoded = decodeThreadPage(raw);
-  if (!Result.isSuccess(decoded)) {
-    return Result.fail(decoded.failure);
-  }
-  const statuses: AzureDevOpsPullRequestStatus[] = [];
-  for (const entry of decoded.success.value) {
-    const decodedEntry = decodePullRequestStatusEntry(entry);
-    if (Exit.isFailure(decodedEntry)) continue;
-    const status = decodedEntry.value;
-    statuses.push({
-      id: status.id,
-      key: `${status.context?.genre?.trim() ?? ""}/${status.context?.name?.trim() ?? ""}`,
-      state: trimmed(status.state),
-      description: trimmed(status.description),
-      url: absoluteUrl(status.targetUrl),
-    });
-  }
-  return Result.succeed(statuses);
-}
-
-function statusStateToCheckStatus(state: string | null): PullRequestCheckStatus {
-  switch (state?.toLowerCase()) {
-    case "succeeded":
-      return "success";
-    case "failed":
-    case "error":
-      return "failure";
-    case "notapplicable":
-      return "skipped";
-    default:
-      // Azure shows a status with no state yet, or `pending`, as waiting.
-      return "pending";
-  }
-}
-
-const RawPolicyEvaluationSchema = Schema.Struct({
-  status: Schema.optional(Schema.NullOr(Schema.String)),
-  configuration: Schema.Struct({
-    isBlocking: Schema.optional(Schema.NullOr(Schema.Boolean)),
-    isEnabled: Schema.optional(Schema.NullOr(Schema.Boolean)),
-    isDeleted: Schema.optional(Schema.NullOr(Schema.Boolean)),
-    url: Schema.optional(Schema.NullOr(Schema.String)),
-    type: Schema.optional(
-      Schema.NullOr(
-        Schema.Struct({
-          id: Schema.optional(Schema.NullOr(Schema.String)),
-          displayName: Schema.optional(Schema.NullOr(Schema.String)),
-        }),
-      ),
-    ),
-    settings: Schema.optional(
-      Schema.NullOr(
-        Schema.Struct({
-          displayName: Schema.optional(Schema.NullOr(Schema.String)),
-          defaultDisplayName: Schema.optional(Schema.NullOr(Schema.String)),
-          statusName: Schema.optional(Schema.NullOr(Schema.String)),
-          manualQueueOnly: Schema.optional(Schema.NullOr(Schema.Boolean)),
-        }),
-      ),
-    ),
-  }),
-  context: Schema.optional(
-    Schema.NullOr(
-      Schema.Struct({
-        buildDefinitionName: Schema.optional(Schema.NullOr(Schema.String)),
-        buildId: Schema.optional(Schema.NullOr(Schema.Number)),
-        isExpired: Schema.optional(Schema.NullOr(Schema.Boolean)),
-        latestStatusId: Schema.optional(Schema.NullOr(Schema.Number)),
-      }),
-    ),
-  ),
-});
-
-/** One branch policy's evaluation on a pull request, as `az repos pr policy list` reports it. */
-export type AzureDevOpsPolicyEvaluation = typeof RawPolicyEvaluationSchema.Type;
-
-const decodePolicyEvaluationEntry = Schema.decodeUnknownExit(RawPolicyEvaluationSchema);
-
-/** Policies that are switched off or deleted still evaluate, but Azure does not list them. */
-export function decodePolicyEvaluationsJson(
-  raw: string,
-): Result.Result<ReadonlyArray<AzureDevOpsPolicyEvaluation>, DecodeFailure> {
-  // `az` prints nothing at all for a pull request no policy applies to.
-  const decoded = decodeUnknownList(raw.length === 0 ? "[]" : raw);
-  if (!Result.isSuccess(decoded)) {
-    return Result.fail(decoded.failure);
-  }
-  const evaluations: AzureDevOpsPolicyEvaluation[] = [];
-  for (const entry of decoded.success) {
-    const decodedEntry = decodePolicyEvaluationEntry(entry);
-    if (Exit.isFailure(decodedEntry)) continue;
-    const { configuration } = decodedEntry.value;
-    if (configuration.isEnabled === false || configuration.isDeleted === true) continue;
-    evaluations.push(decodedEntry.value);
-  }
-  return Result.succeed(evaluations);
-}
-
-function toCheckStatus(
-  status: string | null | undefined,
-  neverQueued: boolean,
-): PullRequestCheckStatus {
-  switch (status?.trim().toLowerCase()) {
-    case "approved":
-      return "success";
-    case "rejected":
-    case "broken":
-      return "failure";
-    case "running":
-      return "pending";
-    case "queued":
-      // An optional build that only runs when someone queues it sits at "queued" forever.
-      return neverQueued ? "skipped" : "pending";
-    case "notapplicable":
-      return "skipped";
-    default:
-      return "neutral";
-  }
-}
-
-/** Builds link to their results page, which hangs off the same project as the policy itself. */
-function buildResultsUrl(configurationUrl: string | null, buildId: number | null): string | null {
-  if (configurationUrl === null || buildId === null) return null;
-  const apisIndex = configurationUrl.indexOf("/_apis/");
-  if (apisIndex < 0) return null;
-  return `${configurationUrl.slice(0, apisIndex)}/_build/results?buildId=${buildId}`;
-}
-
-// Reviewer and merge-strategy policies are review state, not checks in Azure's Checks list.
-export function toPullRequestChecks(
-  evaluations: ReadonlyArray<AzureDevOpsPolicyEvaluation>,
-  statuses: ReadonlyArray<AzureDevOpsPullRequestStatus>,
-): ReadonlyArray<PullRequestCheck> {
-  const statusesById = new Map(statuses.map((status) => [status.id, status]));
-  const policyStatusKeys = new Set<string>();
-  const checks: PullRequestCheck[] = [];
-  for (const { status, configuration, context } of evaluations) {
-    const typeId = configuration.type?.id?.trim().toLowerCase();
-    const settings = configuration.settings;
-    const required = configuration.isBlocking === true;
-    if (typeId === COMMENT_POLICY_TYPE_ID) {
-      checks.push({
-        name: TrimmedNonEmptyString.make("Comments must be resolved"),
-        status: toCheckStatus(status, false),
-        description: null,
-        url: null,
-        required,
-      });
-      continue;
-    }
-    if (typeId === STATUS_POLICY_TYPE_ID) {
-      const latestStatus =
-        context?.latestStatusId == null ? undefined : statusesById.get(context.latestStatusId);
-      if (latestStatus !== undefined) policyStatusKeys.add(latestStatus.key);
-      const name =
-        latestStatus?.description ??
-        trimmed(settings?.displayName) ??
-        trimmed(settings?.defaultDisplayName) ??
-        trimmed(settings?.statusName) ??
-        trimmed(configuration.type?.displayName);
-      if (name === null) continue;
-      checks.push({
-        name: TrimmedNonEmptyString.make(name),
-        status:
-          latestStatus === undefined
-            ? toCheckStatus(status, false)
-            : statusStateToCheckStatus(latestStatus.state),
-        description: null,
-        url: latestStatus?.url ?? null,
-        required,
-      });
-      continue;
-    }
-    if (typeId !== BUILD_POLICY_TYPE_ID) continue;
-    const name =
-      trimmed(settings?.displayName) ??
-      trimmed(context?.buildDefinitionName) ??
-      trimmed(configuration.type?.displayName);
-    if (name === null) continue;
-    const buildId = context?.buildId ?? null;
-    const neverQueued = settings?.manualQueueOnly === true && buildId === null;
-    // An expired build no longer satisfies its policy, and Azure counts it as failed.
-    const expired = context?.isExpired === true;
-    checks.push({
-      name: TrimmedNonEmptyString.make(name),
-      status: expired ? "failure" : toCheckStatus(status, neverQueued),
-      description: expired ? "Expired" : neverQueued ? "Not run" : null,
-      url: buildResultsUrl(trimmed(configuration.url), buildId),
-      required,
-    });
-  }
-  const latestByKey = new Map<string, AzureDevOpsPullRequestStatus>();
-  for (const status of statuses) {
-    const latest = latestByKey.get(status.key);
-    if (latest === undefined || status.id > latest.id) latestByKey.set(status.key, status);
-  }
-  for (const [key, status] of latestByKey) {
-    if (policyStatusKeys.has(key)) continue;
-    const checkStatus = statusStateToCheckStatus(status.state);
-    if (checkStatus === "skipped") continue;
-    const name = status.description ?? trimmed(key.slice(key.indexOf("/") + 1));
-    if (name === null) continue;
-    checks.push({
-      name: TrimmedNonEmptyString.make(name),
-      status: checkStatus,
-      description: null,
-      url: status.url,
-      required: false,
-    });
-  }
-  return checks.toSorted(
-    (left, right) =>
-      Number(right.required) - Number(left.required) || left.name.localeCompare(right.name),
-  );
-}
-
 const RawIterationSchema = Schema.Struct({
   id: Schema.Int,
   sourceRefCommit: Schema.optional(
@@ -618,25 +360,6 @@ const RawChangePageSchema = Schema.Struct({
   nextSkip: Schema.optional(Schema.NullOr(Schema.Number)),
 });
 
-const RawFileDiffBlockSchema = Schema.Struct({
-  changeType: Schema.Literals(["none", "add", "delete", "edit"]),
-  originalLineNumberStart: Schema.Int,
-  originalLinesCount: Schema.Int,
-  modifiedLineNumberStart: Schema.Int,
-  modifiedLinesCount: Schema.Int,
-  originalLines: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
-  modifiedLines: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
-});
-
-const RawFileDiffSchema = Schema.Struct({
-  path: Schema.optional(Schema.NullOr(Schema.String)),
-  originalPath: Schema.optional(Schema.NullOr(Schema.String)),
-  changeType: Schema.optional(Schema.NullOr(Schema.String)),
-  lineDiffBlocks: Schema.optional(Schema.NullOr(Schema.Array(Schema.Unknown))),
-});
-
-const RawFilesDiffPageSchema = Schema.Struct({ fileDiffs: Schema.Array(Schema.Unknown) });
-
 const RawItemContentSchema = Schema.Struct({
   content: Schema.optional(Schema.NullOr(Schema.String)),
   contentMetadata: Schema.optional(
@@ -663,22 +386,6 @@ export interface AzureDevOpsChangePage {
   readonly nextSkip: number | null;
 }
 
-export interface AzureDevOpsDiffBlock {
-  readonly kind: "none" | "add" | "delete" | "edit";
-  readonly oldStart: number;
-  readonly oldCount: number;
-  readonly newStart: number;
-  readonly newCount: number;
-  readonly oldLines: ReadonlyArray<string>;
-  readonly newLines: ReadonlyArray<string>;
-}
-
-export interface AzureDevOpsFileDiff {
-  readonly change: AzureDevOpsChangeEntry;
-  /** Null when the file has no blocks to go by, so it is read instead. */
-  readonly blocks: ReadonlyArray<AzureDevOpsDiffBlock> | null;
-}
-
 export interface AzureDevOpsItemContent {
   readonly contents: string;
   readonly isBinary: boolean;
@@ -688,10 +395,6 @@ const decodeIterationPage = decodeJsonResult(RawIterationPageSchema);
 const decodeIterationEntry = Schema.decodeUnknownExit(RawIterationSchema);
 const decodeChangePage = decodeJsonResult(RawChangePageSchema);
 const decodeChangeEntry = Schema.decodeUnknownExit(RawChangeEntrySchema);
-const decodeQuotedJson = decodeJsonResult(Schema.String);
-const decodeFilesDiffPage = decodeJsonResult(RawFilesDiffPageSchema);
-const decodeFileDiff = Schema.decodeUnknownExit(RawFileDiffSchema);
-const decodeFileDiffBlock = Schema.decodeUnknownExit(RawFileDiffBlockSchema);
 const decodeItemContent = decodeJsonResult(RawItemContentSchema);
 
 /** Preserve whitespace to match patch paths and viewed marks. */
@@ -766,61 +469,6 @@ export function decodeIterationChangesJson(
     changes,
     nextSkip: nextSkip !== null && Number.isSafeInteger(nextSkip) && nextSkip > 0 ? nextSkip : null,
   });
-}
-
-function toDiffBlocks(raw: ReadonlyArray<unknown>): ReadonlyArray<AzureDevOpsDiffBlock> | null {
-  const blocks: AzureDevOpsDiffBlock[] = [];
-  for (const entry of raw) {
-    const decoded = decodeFileDiffBlock(entry);
-    if (Exit.isFailure(decoded)) return null;
-    const block = decoded.value;
-    blocks.push({
-      kind: block.changeType,
-      oldStart: block.originalLineNumberStart,
-      oldCount: block.originalLinesCount,
-      newStart: block.modifiedLineNumberStart,
-      newCount: block.modifiedLinesCount,
-      oldLines: block.originalLines ?? [],
-      newLines: block.modifiedLines ?? [],
-    });
-  }
-  return blocks;
-}
-
-/**
- * One page of files with their diff blocks. A row that cannot be read fails the page, which
- * counts every row Azure sent. The page arrives as a JSON string (`to_string(@)`) because on
- * Windows `az` drops every character its console code page lacks from plain JSON, page-wide.
- */
-export function decodeFilesDiffJson(
-  raw: string,
-): Result.Result<ReadonlyArray<AzureDevOpsFileDiff>, unknown> {
-  const quoted = decodeQuotedJson(raw);
-  if (!Result.isSuccess(quoted)) return Result.fail(quoted.failure);
-  const decoded = decodeFilesDiffPage(quoted.success);
-  if (!Result.isSuccess(decoded)) return Result.fail(decoded.failure);
-  const files: AzureDevOpsFileDiff[] = [];
-  for (const entry of decoded.success.fileDiffs) {
-    const decodedFile = decodeFileDiff(entry);
-    if (Exit.isFailure(decodedFile)) return Result.fail(decodedFile.cause);
-    const file = decodedFile.value;
-    const originalPath = toRepositoryPath(file.originalPath);
-    // A deleted file has no current path.
-    const path = toRepositoryPath(file.path) ?? originalPath;
-    if (path === null) return Result.fail(new Error("A file diff named no path."));
-    const oldPath = originalPath ?? path;
-    files.push({
-      change: {
-        path,
-        oldPath,
-        changeKind: toChangeKind(file.changeType, oldPath !== path),
-        objectId: null,
-        originalObjectId: null,
-      },
-      blocks: toDiffBlocks(file.lineDiffBlocks ?? []),
-    });
-  }
-  return Result.succeed(files);
 }
 
 /** Azure returns an empty body for absent files. Binary status comes from its metadata. */

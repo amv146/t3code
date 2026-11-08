@@ -9,11 +9,7 @@ import {
   serializeAssistantCitation,
   withAssistantCitationComment,
 } from "@t3tools/shared/assistantCitations";
-import {
-  detectComposerPullRequestTrigger,
-  isCurrencyAmountQuery,
-  isPathWord,
-} from "@t3tools/shared/composerTrigger";
+import { isCurrencyAmountQuery, isPathWord } from "@t3tools/shared/composerTrigger";
 import {
   splitPromptIntoComposerSegments,
   type ComposerPromptSegment,
@@ -265,8 +261,15 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
       rangeEnd: cursor,
     };
   }
-  const pullRequestTrigger = detectComposerPullRequestTrigger(token, cursor);
-  if (pullRequestTrigger) return pullRequestTrigger;
+  const pullRequestMatch = /^#([\p{L}\p{N}][\p{L}\p{N}_-]*)?$/u.exec(token);
+  if (pullRequestMatch) {
+    return {
+      kind: "pull-request",
+      query: pullRequestMatch[1] ?? "",
+      rangeStart: tokenStart,
+      rangeEnd: cursor,
+    };
+  }
   const skillPrefix = /^\p{Sc}/u.exec(token);
   if (skillPrefix) {
     if (isCurrencyAmountQuery(token.slice(skillPrefix[0].length))) return null;

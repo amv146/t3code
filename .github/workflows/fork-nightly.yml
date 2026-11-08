@@ -71,6 +71,8 @@ jobs:
             !/.repos/
           sparse-checkout-cone-mode: false
       - uses: ./.github/actions/setup-ci-deps
+      - name: Install Chromium for changed browser tests
+        run: node apps/web/node_modules/playwright/cli.js install --with-deps --only-shell chromium
       - name: Check fork changes against the upstream nightly
         env:
           UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}

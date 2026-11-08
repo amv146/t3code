@@ -40,18 +40,6 @@ function outputWithin(maxOutputBytes: number | undefined, response: string) {
 
 const json = (value: Record<string, unknown>) => JSON.stringify(value);
 
-/** The `az` call for a files diff, when the organization does not offer one. */
-const filesDiffRefused = () =>
-  Effect.fail(
-    new AzureDevOpsCli.AzureDevOpsCommandFailedError({
-      operation: "execute",
-      command: "az",
-      cwd: "/w",
-      argumentCount: 1,
-      cause: "the files diff is not offered here",
-    }),
-  );
-
 const pullRequestRow = {
   pullRequestId: 42,
   title: "Add the page",
@@ -148,9 +136,7 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
             ),
           ),
         )
-        .mockReturnValueOnce(Effect.succeed(output(json({ changeEntries: [] }))))
-        .mockReturnValueOnce(Effect.succeed(output("[]")))
-        .mockReturnValueOnce(Effect.succeed(output(json({ value: [] }))));
+        .mockReturnValueOnce(Effect.succeed(output(json({ changeEntries: [] }))));
       const provider = yield* AzureDevOpsPullRequestProvider.make;
       const detail = yield* provider.getChangeRequest({
         cwd: "/w",
@@ -161,7 +147,7 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
 
       expect(detail.headSha).toBe(latestHead);
       expect(argsOfCall(2)).toContain("iterationId=2");
-      expect(mockedExecute).toHaveBeenCalledTimes(5);
+      expect(mockedExecute).toHaveBeenCalledTimes(3);
     }),
   );
 
@@ -606,7 +592,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       mockedExecute
         .mockReturnValueOnce(Effect.succeed(output(json(pullRequestRow))))
         .mockReturnValueOnce(Effect.succeed(output(json(oneIteration))))
-        .mockReturnValueOnce(filesDiffRefused())
         .mockReturnValueOnce(
           Effect.succeed(
             output(
@@ -651,7 +636,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       mockedExecute
         .mockReturnValueOnce(Effect.succeed(output(json(pullRequestRow))))
         .mockReturnValueOnce(Effect.succeed(output(json(oneIteration))))
-        .mockReturnValueOnce(filesDiffRefused())
         .mockReturnValueOnce(
           Effect.succeed(
             output(
@@ -718,7 +702,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
             ),
           ),
         )
-        .mockReturnValueOnce(filesDiffRefused())
         .mockReturnValueOnce(
           Effect.succeed(
             output(
@@ -744,7 +727,7 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
         number: 42,
       });
 
-      expect(argsOfCall(4)).toContain("includeContentMetadata=true");
+      expect(argsOfCall(3)).toContain("includeContentMetadata=true");
       expect(slice.patch).toContain("Binary files a/logo.png and b/logo.png differ");
       assert.isTrue(slice.truncated);
     }),
@@ -883,101 +866,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
     }),
   );
 
-  it.effect("asks for a page of files with their diffs through the preview route", () =>
-    Effect.gen(function* () {
-      mockedExecute.mockReturnValueOnce(
-        Effect.succeed(
-          output(
-            // `to_string(@)`: the page's JSON as a string.
-            JSON.stringify(
-              json({
-                fileDiffs: [{ path: "/a.ts", originalPath: "/a.ts", changeType: "edit" }],
-              }),
-            ),
-          ),
-        ),
-      );
-      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
-
-      const files = yield* cli.listFilesDiff({
-        cwd: "/w",
-        location: { project: "platform", repository: "web" },
-        number: 42,
-        top: 50,
-        skip: 100,
-      });
-
-      assert.deepStrictEqual(argsOfCall(0), [
-        "devops",
-        "invoke",
-        "--detect",
-        "true",
-        "--area",
-        "git",
-        "--resource",
-        "pullRequestFilesDiff",
-        "--api-version",
-        "7.2-preview",
-        "--route-parameters",
-        "project=platform",
-        "repositoryId=web",
-        "pullRequestId=42",
-        "--query-parameters",
-        "$top=50",
-        "$skip=100",
-        "--query",
-        "to_string(@)",
-        "--only-show-errors",
-        "--output",
-        "json",
-      ]);
-      assert.deepStrictEqual(
-        files.map((file) => file.change.path),
-        ["a.ts"],
-      );
-    }),
-  );
-
-  it.effect("reads a page too large for its output limit as unreadable rather than short", () =>
-    Effect.gen(function* () {
-      const response = JSON.stringify(
-        json({
-          fileDiffs: Array.from({ length: 50 }, (_, index) => ({
-            path: `/file-${index}.ts`,
-            originalPath: `/file-${index}.ts`,
-            changeType: "add",
-            lineDiffBlocks: [
-              {
-                changeType: "add",
-                originalLineNumberStart: 0,
-                originalLinesCount: 0,
-                modifiedLineNumberStart: 1,
-                modifiedLinesCount: 1,
-                modifiedLines: ["x".repeat(400_000)],
-              },
-            ],
-          })),
-        }),
-      );
-      mockedExecute.mockImplementationOnce((input) =>
-        Effect.succeed(outputWithin(input.maxOutputBytes, response)),
-      );
-      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
-
-      const error = yield* Effect.flip(
-        cli.listFilesDiff({
-          cwd: "/w",
-          location: { project: "platform", repository: "web" },
-          number: 42,
-          top: 50,
-          skip: 0,
-        }),
-      );
-
-      assert.strictEqual(error._tag, "AzureDevOpsPullRequestReadError");
-    }),
-  );
-
   it.effect("reports a pull request it cannot place as its own outcome", () =>
     Effect.gen(function* () {
       mockedExecute.mockReturnValueOnce(
@@ -998,44 +886,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       const error = yield* Effect.flip(cli.getPullRequest({ cwd: "/w", number: 42 }));
 
       assert.strictEqual(error._tag, "AzureDevOpsPullRequestIncompleteError");
-    }),
-  );
-
-  it.effect("reads a pull request's policies, and nothing when none apply", () =>
-    Effect.gen(function* () {
-      mockedExecute.mockReturnValueOnce(Effect.succeed(output("")));
-      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
-
-      const evaluations = yield* cli.listPolicyEvaluations({ cwd: "/w", number: 42 });
-
-      expect(evaluations).toEqual([]);
-      expect(argsOfCall(0).slice(0, 4)).toEqual(["repos", "pr", "policy", "list"]);
-      expect(argsOfCall(0)).toContain("42");
-    }),
-  );
-
-  it.effect("reads only the status fields the checks use", () =>
-    Effect.gen(function* () {
-      mockedExecute.mockReturnValueOnce(
-        Effect.succeed(
-          output(
-            json({
-              value: [{ id: 1, state: "succeeded", description: "Build", context: { name: "ci" } }],
-            }),
-          ),
-        ),
-      );
-      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
-
-      const statuses = yield* cli.listPullRequestStatuses({
-        cwd: "/w",
-        location: { project: "platform", repository: "web" },
-        number: 42,
-      });
-
-      expect(statuses.map((status) => status.description)).toEqual(["Build"]);
-      // A status carries every identity Azure knows of it, which is most of a large response.
-      expect(argsOfCall(0)).toContain("--query");
     }),
   );
 

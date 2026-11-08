@@ -13,23 +13,17 @@ import type {
 
 import * as AzureDevOpsCli from "./AzureDevOpsCli.ts";
 import {
-  decodeFilesDiffJson,
   decodeItemContentJson,
   decodeIterationChangesJson,
   decodeIterationsJson,
-  decodePolicyEvaluationsJson,
   decodePullRequestJson,
   decodePullRequestListJson,
-  decodePullRequestStatusesJson,
   decodeThreadsJson,
   decodeViewerJson,
   type AzureDevOpsChangeEntry,
-  type AzureDevOpsFileDiff,
   type AzureDevOpsItemContent,
   type AzureDevOpsIteration,
-  type AzureDevOpsPolicyEvaluation,
   type AzureDevOpsPullRequest,
-  type AzureDevOpsPullRequestStatus,
   type AzureDevOpsRepositoryLocation,
 } from "./azureDevOpsPullRequestJson.ts";
 import type { ProviderListCursor } from "@t3tools/source-control-core/server/PullRequestProvider";
@@ -109,23 +103,13 @@ export type AzureDevOpsPullRequestCliError =
   | AzureDevOpsViewerUnavailableError;
 
 const REST_API_VERSION = "7.1";
-/**
- * The pull request files diff is registered as a preview. The extension rejects `7.2-preview.1`
- * (it parses the version as a float) and Azure rejects a plain `7.2`, so only this spelling works.
- */
-const FILES_DIFF_API_VERSION = "7.2-preview";
 const PULL_REQUEST_LIST_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
-/** A page of diffs carries line text, which `az` prints with the escapes of a JSON string. */
-const FILES_DIFF_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 /** A 2,000-file page exceeds the default 1 MiB output budget. */
 const CHANGE_ENTRIES_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 /** JSON escaping and base64 can exceed the decoded file's size. */
 const ITEM_CONTENT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 /** Review history is unpaged and independent of diff size. */
 const REVIEW_HISTORY_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
-/** The status fields the Checks list reads, in the `{ value }` page shape statuses arrive in. */
-const PULL_REQUEST_STATUS_FIELDS =
-  "{value:value[].{id:id,state:state,description:description,targetUrl:targetUrl,context:context}}";
 
 /** Azure's iteration-change page limit. */
 const CHANGE_ENTRIES_PER_PAGE = 2000;
@@ -173,22 +157,6 @@ export class AzureDevOpsPullRequestCli extends Context.Service<
       readonly number: number;
     }) => Effect.Effect<AzureDevOpsPullRequest, AzureDevOpsPullRequestCliError>;
 
-    /** Branch policy evaluations, which need only the number, so they can read alongside it. */
-    readonly listPolicyEvaluations: (input: {
-      readonly cwd: string;
-      readonly number: number;
-    }) => Effect.Effect<ReadonlyArray<AzureDevOpsPolicyEvaluation>, AzureDevOpsPullRequestCliError>;
-
-    /** Statuses external services posted, which Azure's Checks list shows beside policies. */
-    readonly listPullRequestStatuses: (input: {
-      readonly cwd: string;
-      readonly location: AzureDevOpsRepositoryLocation;
-      readonly number: number;
-    }) => Effect.Effect<
-      ReadonlyArray<AzureDevOpsPullRequestStatus>,
-      AzureDevOpsPullRequestCliError
-    >;
-
     readonly listThreads: (input: {
       readonly cwd: string;
       readonly location: AzureDevOpsRepositoryLocation;
@@ -215,15 +183,6 @@ export class AzureDevOpsPullRequestCli extends Context.Service<
       readonly path: string;
       readonly commit: string;
     }) => Effect.Effect<AzureDevOpsItemContent, AzureDevOpsPullRequestCliError>;
-
-    /** The latest iteration's files and diff blocks in one call, `top` files from `skip`. */
-    readonly listFilesDiff: (input: {
-      readonly cwd: string;
-      readonly location: AzureDevOpsRepositoryLocation;
-      readonly number: number;
-      readonly top: number;
-      readonly skip: number;
-    }) => Effect.Effect<ReadonlyArray<AzureDevOpsFileDiff>, AzureDevOpsPullRequestCliError>;
 
     readonly runPullRequestAction: (input: {
       readonly cwd: string;
@@ -337,11 +296,8 @@ export const make = Effect.gen(function* () {
     readonly cwd: string;
     readonly operation: string;
     readonly resource: string;
-    readonly apiVersion?: string;
     readonly routeParameters: ReadonlyArray<string>;
     readonly queryParameters?: ReadonlyArray<string>;
-    /** A JMESPath query applied to the result before it is printed. */
-    readonly query?: string;
     readonly maxOutputBytes?: number;
     readonly decode: (raw: string) => Result.Result<A, unknown>;
   }): Effect.Effect<A, AzureDevOpsPullRequestCliError> =>
@@ -357,13 +313,12 @@ export const make = Effect.gen(function* () {
         "--resource",
         input.resource,
         "--api-version",
-        input.apiVersion ?? REST_API_VERSION,
+        REST_API_VERSION,
         "--route-parameters",
         ...input.routeParameters,
         ...(input.queryParameters === undefined
           ? []
           : ["--query-parameters", ...input.queryParameters]),
-        ...(input.query === undefined ? [] : ["--query", input.query]),
       ],
     }).pipe(
       Effect.flatMap((result) => {
@@ -590,45 +545,6 @@ export const make = Effect.gen(function* () {
       );
     }),
 
-    listPolicyEvaluations: Effect.fn("AzureDevOpsPullRequestCli.listPolicyEvaluations")(
-      function (input) {
-        return executeJson({
-          cwd: input.cwd,
-          args: ["repos", "pr", "policy", "list", ...detectArgs, "--id", String(input.number)],
-        }).pipe(
-          Effect.flatMap((result) => {
-            const decoded = decodePolicyEvaluationsJson(result.stdout.trim());
-            return Result.isSuccess(decoded)
-              ? Effect.succeed(decoded.success)
-              : Effect.fail(
-                  new AzureDevOpsPullRequestReadError({
-                    command: "az",
-                    cwd: input.cwd,
-                    operation: "listPolicyEvaluations",
-                    cause: decoded.failure,
-                  }),
-                );
-          }),
-        );
-      },
-    ),
-
-    listPullRequestStatuses: Effect.fn("AzureDevOpsPullRequestCli.listPullRequestStatuses")(
-      function (input) {
-        return invoke({
-          cwd: input.cwd,
-          operation: "listPullRequestStatuses",
-          resource: "pullRequestStatuses",
-          routeParameters: pullRequestRoute(input),
-          maxOutputBytes: REVIEW_HISTORY_MAX_OUTPUT_BYTES,
-          // Each status carries its creator's profile and links, several times the fields read
-          // here, which costs `az` seconds to print on a busy pull request.
-          query: PULL_REQUEST_STATUS_FIELDS,
-          decode: decodePullRequestStatusesJson,
-        });
-      },
-    ),
-
     listThreads: Effect.fn("AzureDevOpsPullRequestCli.listThreads")(function (input) {
       return invoke({
         cwd: input.cwd,
@@ -699,21 +615,6 @@ export const make = Effect.gen(function* () {
         ],
         maxOutputBytes: ITEM_CONTENT_MAX_OUTPUT_BYTES,
         decode: decodeItemContentJson,
-      });
-    }),
-
-    listFilesDiff: Effect.fn("AzureDevOpsPullRequestCli.listFilesDiff")(function (input) {
-      return invoke({
-        cwd: input.cwd,
-        operation: "listFilesDiff",
-        resource: "pullRequestFilesDiff",
-        apiVersion: FILES_DIFF_API_VERSION,
-        routeParameters: pullRequestRoute(input),
-        queryParameters: [`$top=${input.top}`, `$skip=${input.skip}`],
-        // The page as a string of JSON text, which `az` prints in ASCII whatever the code page.
-        query: "to_string(@)",
-        maxOutputBytes: FILES_DIFF_MAX_OUTPUT_BYTES,
-        decode: decodeFilesDiffJson,
       });
     }),
 

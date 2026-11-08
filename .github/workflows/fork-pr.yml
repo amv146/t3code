@@ -1,0 +1,42 @@
+name: Fork PR
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base ref for changed-file checks
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Fork PR validation
+    if: github.repository == 'amv146/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - uses: ./.github/actions/setup-ci-deps
+      - name: Install Chromium for changed browser tests
+        run: node apps/web/node_modules/playwright/cli.js install --with-deps --only-shell chromium
+      - name: Check changes against the target branch
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || format('origin/{0}', inputs.base) }}
+        run: vp run check:changed "$BASE"

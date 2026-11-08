@@ -13,7 +13,9 @@ appear in the normal update UI; official nightly installers still use the
 upstream feed and would replace your changes.
 
 Add fixes and features to this fork's `main` through normal commits or pull
-requests. A push requests a new build even when upstream has not released another
+requests. The **Fork PR validation** check runs the changed-file checks on
+GitHub-hosted runners, including Chromium for browser tests; upstream CI uses
+maintainer-only Blacksmith runners. A push requests a new build even when upstream has not released another
 nightly. Builds use the upstream nightly's version core and a nightly build date
 and workflow run ID, so each build has a distinct updater-compatible version.
 Rerunning a failed workflow is safe: only a published release with the exact
