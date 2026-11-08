@@ -590,40 +590,44 @@ export const make = Effect.gen(function* () {
       );
     }),
 
-    listPolicyEvaluations: Effect.fn("AzureDevOpsPullRequestCli.listPolicyEvaluations")(function (input) {
-      return executeJson({
-        cwd: input.cwd,
-        args: ["repos", "pr", "policy", "list", ...detectArgs, "--id", String(input.number)],
-      }).pipe(
-        Effect.flatMap((result) => {
-          const decoded = decodePolicyEvaluationsJson(result.stdout.trim());
-          return Result.isSuccess(decoded)
-            ? Effect.succeed(decoded.success)
-            : Effect.fail(
-                new AzureDevOpsPullRequestReadError({
-                  command: "az",
-                  cwd: input.cwd,
-                  operation: "listPolicyEvaluations",
-                  cause: decoded.failure,
-                }),
-              );
-        }),
-      );
-    }),
+    listPolicyEvaluations: Effect.fn("AzureDevOpsPullRequestCli.listPolicyEvaluations")(
+      function (input) {
+        return executeJson({
+          cwd: input.cwd,
+          args: ["repos", "pr", "policy", "list", ...detectArgs, "--id", String(input.number)],
+        }).pipe(
+          Effect.flatMap((result) => {
+            const decoded = decodePolicyEvaluationsJson(result.stdout.trim());
+            return Result.isSuccess(decoded)
+              ? Effect.succeed(decoded.success)
+              : Effect.fail(
+                  new AzureDevOpsPullRequestReadError({
+                    command: "az",
+                    cwd: input.cwd,
+                    operation: "listPolicyEvaluations",
+                    cause: decoded.failure,
+                  }),
+                );
+          }),
+        );
+      },
+    ),
 
-    listPullRequestStatuses: Effect.fn("AzureDevOpsPullRequestCli.listPullRequestStatuses")(function (input) {
-      return invoke({
-        cwd: input.cwd,
-        operation: "listPullRequestStatuses",
-        resource: "pullRequestStatuses",
-        routeParameters: pullRequestRoute(input),
-        maxOutputBytes: REVIEW_HISTORY_MAX_OUTPUT_BYTES,
-        // Each status carries its creator's profile and links, several times the fields read
-        // here, which costs `az` seconds to print on a busy pull request.
-        query: PULL_REQUEST_STATUS_FIELDS,
-        decode: decodePullRequestStatusesJson,
-      });
-    }),
+    listPullRequestStatuses: Effect.fn("AzureDevOpsPullRequestCli.listPullRequestStatuses")(
+      function (input) {
+        return invoke({
+          cwd: input.cwd,
+          operation: "listPullRequestStatuses",
+          resource: "pullRequestStatuses",
+          routeParameters: pullRequestRoute(input),
+          maxOutputBytes: REVIEW_HISTORY_MAX_OUTPUT_BYTES,
+          // Each status carries its creator's profile and links, several times the fields read
+          // here, which costs `az` seconds to print on a busy pull request.
+          query: PULL_REQUEST_STATUS_FIELDS,
+          decode: decodePullRequestStatusesJson,
+        });
+      },
+    ),
 
     listThreads: Effect.fn("AzureDevOpsPullRequestCli.listThreads")(function (input) {
       return invoke({
