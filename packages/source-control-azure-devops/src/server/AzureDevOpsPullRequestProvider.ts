@@ -216,8 +216,24 @@ export const make = Effect.gen(function* () {
 
   const EMPTY_DIFF_SLICE: ProviderDiffSlice = { patch: "", truncated: false, nextCursor: null };
 
-  // PR locations are immutable; caching avoids full PR reads for viewed-file checks.
+  // PR locations are immutable; every pull request read records one so later reads can skip it.
   const locations = new Map<string, AzureDevOpsRepositoryLocation>();
+
+  const readPullRequest = Effect.fn("AzureDevOpsPullRequestProvider.readPullRequest")(
+    function* (input: { readonly cwd: string; readonly number: number }) {
+      const pullRequest = yield* cli.getPullRequest({ cwd: input.cwd, number: input.number });
+      const location = pullRequest.location;
+      if (location === null) return pullRequest;
+      const key = `${input.cwd} ${input.number}`;
+      locations.delete(key);
+      if (locations.size >= LOCATION_CACHE_CAPACITY) {
+        const oldest = locations.keys().next().value;
+        if (oldest !== undefined) locations.delete(oldest);
+      }
+      locations.set(key, location);
+      return pullRequest;
+    },
+  );
 
   const locationOf = (input: { readonly cwd: string; readonly number: number }) => {
     const key = `${input.cwd} ${input.number}`;
@@ -227,18 +243,7 @@ export const make = Effect.gen(function* () {
       locations.set(key, held);
       return Effect.succeed(held);
     }
-    return cli.getPullRequest({ cwd: input.cwd, number: input.number }).pipe(
-      Effect.map((pullRequest) => {
-        const location = pullRequest.location;
-        if (location === null) return null;
-        if (locations.size >= LOCATION_CACHE_CAPACITY) {
-          const oldest = locations.keys().next().value;
-          if (oldest !== undefined) locations.delete(oldest);
-        }
-        locations.set(key, location);
-        return location;
-      }),
-    );
+    return readPullRequest(input).pipe(Effect.map((pullRequest) => pullRequest.location));
   };
 
   const diffScope = Effect.fn("AzureDevOpsPullRequestProvider.diffScope")(function* (input: {
@@ -489,7 +494,7 @@ export const make = Effect.gen(function* () {
         ),
 
     getChangeRequestPreview: (input) =>
-      cli.getPullRequest({ cwd: input.cwd, number: input.number }).pipe(
+      readPullRequest(input).pipe(
         Effect.mapError(fail("getChangeRequestPreview")),
         Effect.map((pullRequest) => ({
           number: pullRequest.number,
@@ -503,16 +508,17 @@ export const make = Effect.gen(function* () {
       ),
 
     getChangeRequestSummary: (input) =>
-      cli
-        .getPullRequest({ cwd: input.cwd, number: input.number })
-        .pipe(Effect.mapError(fail("getChangeRequestSummary")), Effect.map(toSummary)),
+      readPullRequest(input).pipe(
+        Effect.mapError(fail("getChangeRequestSummary")),
+        Effect.map(toSummary),
+      ),
 
     getChangeRequestChecks: Effect.fn("AzureDevOpsPullRequestProvider.getChangeRequestChecks")(
       function* (input) {
         // Policies need only the number, so they read while the pull request is still loading.
         const [{ pullRequest, statuses }, evaluations] = yield* Effect.all(
           [
-            cli.getPullRequest({ cwd: input.cwd, number: input.number }).pipe(
+            readPullRequest(input).pipe(
               Effect.flatMap((pullRequest) =>
                 listStatuses({
                   cwd: input.cwd,
@@ -532,7 +538,7 @@ export const make = Effect.gen(function* () {
 
     getChangeRequest: Effect.fn("AzureDevOpsPullRequestProvider.getChangeRequest")(
       function* (input) {
-        const pullRequest = yield* cli.getPullRequest({ cwd: input.cwd, number: input.number });
+        const pullRequest = yield* readPullRequest(input);
         const location = pullRequest.location;
         const iterations =
           location === null
@@ -594,15 +600,15 @@ export const make = Effect.gen(function* () {
     ),
 
     getChangeRequestActivity: (input) =>
-      cli.getPullRequest({ cwd: input.cwd, number: input.number }).pipe(
+      locationOf(input).pipe(
         Effect.mapError(fail("getChangeRequestActivity")),
-        Effect.flatMap((pullRequest) =>
-          (pullRequest.location === null
+        Effect.flatMap((location) =>
+          (location === null
             ? Effect.succeed({ comments: [], truncated: true })
             : cli
                 .listThreads({
                   cwd: input.cwd,
-                  location: pullRequest.location,
+                  location,
                   number: input.number,
                 })
                 .pipe(
