@@ -17,7 +17,11 @@ import {
   MAX_FILE_DIFF_EDITS,
   parseAzureDevOpsDiffCursor,
 } from "./azureDevOpsDiff.ts";
-import type { AzureDevOpsChangeEntry, AzureDevOpsFileDiff } from "./azureDevOpsPullRequestJson.ts";
+import type {
+  AzureDevOpsChangeEntry,
+  AzureDevOpsFileDiff,
+  AzureDevOpsPolicyEvaluation,
+} from "./azureDevOpsPullRequestJson.ts";
 
 const ITERATION = { id: 3, headCommit: "head", mergeBaseCommit: "base" };
 
@@ -50,6 +54,25 @@ const filesDiffUnavailable = Effect.fail(
     cause: "unavailable",
   }),
 );
+
+const CI_EVALUATION: AzureDevOpsPolicyEvaluation = {
+  status: "approved",
+  configuration: {
+    isBlocking: true,
+    type: { id: "0609b952-1397-4640-95ec-e00a01b2c241", displayName: "Build" },
+    settings: { displayName: "CI" },
+  },
+};
+
+const CI_CHECK = { name: "CI", status: "success", description: null, url: null, required: true };
+
+const readError = (operation: string) =>
+  new AzureDevOpsPullRequestCli.AzureDevOpsPullRequestReadError({
+    command: "az",
+    cwd: "/w",
+    operation,
+    cause: "denied",
+  });
 
 function change(
   path: string,
@@ -153,6 +176,8 @@ describe("getChangeRequest", () => {
                   cause: "unavailable",
                 }),
               ),
+            listPolicyEvaluations: () => Effect.succeed([]),
+            listPullRequestStatuses: () => Effect.succeed([]),
           }),
         ),
       );
@@ -187,6 +212,8 @@ describe("getChangeRequest", () => {
                         cause: "unavailable",
                       }),
                     ),
+              listPolicyEvaluations: () => Effect.succeed([]),
+              listPullRequestStatuses: () => Effect.succeed([]),
             }),
           ),
         );
@@ -199,6 +226,98 @@ describe("getChangeRequest", () => {
         expect(detail.headSha).toBeUndefined();
         expect(detail.changedFiles).toBe(0);
       }),
+  );
+
+  it.effect("carries the policy checks, and still answers when they cannot be read", () =>
+    Effect.gen(function* () {
+      let policyReadFails = false;
+
+      const provider = yield* make.pipe(
+        Effect.provide(
+          Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+            getPullRequest: () => Effect.succeed(PULL_REQUEST),
+            listIterations: () => Effect.succeed([ITERATION]),
+            listIterationChanges: () =>
+              Effect.succeed({ changes: [change("a.ts")], truncated: false }),
+            listPolicyEvaluations: () =>
+              policyReadFails
+                ? Effect.fail(readError("listPolicyEvaluations"))
+                : Effect.succeed([CI_EVALUATION]),
+            listPullRequestStatuses: () => Effect.succeed([]),
+          }),
+        ),
+      );
+      const input = { cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 };
+
+      const checkedDetail = yield* provider.getChangeRequest(input);
+      expect(checkedDetail.checks).toEqual([CI_CHECK]);
+      expect(checkedDetail.headSha).toBe(ITERATION.headCommit);
+      expect(checkedDetail.changedFiles).toBe(1);
+
+      policyReadFails = true;
+      const detail = yield* provider.getChangeRequest(input);
+      expect(detail.checks).toEqual([]);
+      expect(detail.changedFiles).toBe(1);
+    }),
+  );
+});
+
+describe("getChangeRequestChecks", () => {
+  const readChecksOf = (provider: Effect.Success<typeof make>) => {
+    const readChecks = provider.getChangeRequestChecks;
+    if (readChecks === undefined) return Effect.die("checks read was not implemented");
+    return readChecks({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 });
+  };
+
+  it.effect("reports the policy and status checks alongside the pull request's state", () =>
+    Effect.gen(function* () {
+      const provider = yield* make.pipe(
+        Effect.provide(
+          Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+            getPullRequest: () => Effect.succeed({ ...PULL_REQUEST, state: "merged" as const }),
+            listPolicyEvaluations: () => Effect.succeed([CI_EVALUATION]),
+            listPullRequestStatuses: ({ location }) =>
+              Effect.succeed(
+                location.repository === "web"
+                  ? [
+                      {
+                        id: 1,
+                        key: "lint/eslint",
+                        state: "succeeded",
+                        description: "Lint",
+                        url: null,
+                      },
+                    ]
+                  : [],
+              ),
+          }),
+        ),
+      );
+
+      expect(yield* readChecksOf(provider)).toEqual({
+        state: "merged",
+        checks: [
+          CI_CHECK,
+          { name: "Lint", status: "success", description: null, url: null, required: false },
+        ],
+      });
+    }),
+  );
+
+  it.effect("keeps the policy checks when the statuses cannot be read", () =>
+    Effect.gen(function* () {
+      const provider = yield* make.pipe(
+        Effect.provide(
+          Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+            getPullRequest: () => Effect.succeed(PULL_REQUEST),
+            listPolicyEvaluations: () => Effect.succeed([CI_EVALUATION]),
+            listPullRequestStatuses: () => Effect.fail(readError("listPullRequestStatuses")),
+          }),
+        ),
+      );
+
+      expect(yield* readChecksOf(provider)).toEqual({ state: "open", checks: [CI_CHECK] });
+    }),
   );
 });
 
