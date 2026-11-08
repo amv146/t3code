@@ -17,7 +17,7 @@ permissions:
 jobs:
   sync:
     if: github.repository == 'amv146/t3code' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -54,7 +54,7 @@ jobs:
   bundle:
     needs: sync
     if: needs.sync.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
       clerk_publishable_key: ${{ steps.config.outputs.clerk_publishable_key }}
@@ -111,7 +111,7 @@ jobs:
   wsl:
     name: Build Linux x64
     needs: [sync, bundle]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       T3CODE_CLERK_PUBLISHABLE_KEY: ${{ needs.bundle.outputs.clerk_publishable_key }}
@@ -180,7 +180,7 @@ jobs:
       AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
     with:
       label: Windows x64
-      runner: ubuntu-latest
+      runner: ubuntu-24.04
       verify_runner: windows-2025
       platform: win
       target: nsis
@@ -199,7 +199,7 @@ jobs:
 
   publish:
     needs: [sync, windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
