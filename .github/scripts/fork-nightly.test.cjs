@@ -136,7 +136,7 @@ function prepareFixture(fork, releases = []) {
         prepareForkNightly({
           github,
           context: { repo: { owner: "amv146", repo: "t3code" }, ref: "refs/heads/main" },
-          core: { setOutput(name, value) { outputs[name] = value; }, info() {} },
+          core: { setOutput(name, value) { outputs[name] = value; }, info(message) { console.log(message); } },
         }).then(() => console.log("FORK_OUTPUTS=" + JSON.stringify(outputs)));
       `,
     ],
@@ -168,8 +168,20 @@ test("merges and pushes the nightly without losing personal commits, then skips 
 });
 
 test("a conflicting upstream update fails without pushing over the fork branch", (t) => {
-  const { fork, remote, before, git } = gitFixture(t, true);
-  assert.throws(() => prepareFixture(fork));
+  const { fork, remote, upstream, before, git } = gitFixture(t, true);
+  assert.throws(
+    () => prepareFixture(fork),
+    (error) => {
+      const marker = error.stdout.match(/FORK_NIGHTLY_CONFLICT=(\{[^\r\n]+\})/);
+      assert.ok(marker, "a real conflict must emit bounded metadata for the repair trigger");
+      assert.deepEqual(JSON.parse(marker[1]), {
+        fork_base: before,
+        upstream_sha: git(upstream, "rev-parse", "HEAD"),
+        upstream_tag: upstreamTag,
+      });
+      return true;
+    },
+  );
   assert.equal(git(fork, "--git-dir", remote, "rev-parse", "refs/heads/main"), before);
   assert.equal(fs.readFileSync(path.join(fork, "personal.txt"), "utf8"), "personal feature\n");
 });

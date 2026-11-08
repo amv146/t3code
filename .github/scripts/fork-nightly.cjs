@@ -78,11 +78,25 @@ async function prepareForkNightly({ github, context, core }) {
     `refs/tags/${upstream.tag_name}`,
   ]);
   const upstreamSha = git(["rev-parse", "FETCH_HEAD^{commit}"]);
-  execFileSync(
-    "git",
-    ["merge", "--no-edit", "-m", `Merge upstream nightly ${upstream.tag_name}`, upstreamSha],
-    { stdio: "inherit" },
-  );
+  const forkBase = git(["rev-parse", "HEAD"]);
+  try {
+    execFileSync(
+      "git",
+      ["merge", "--no-edit", "-m", `Merge upstream nightly ${upstream.tag_name}`, upstreamSha],
+      { stdio: "inherit" },
+    );
+  } catch (error) {
+    if (git(["ls-files", "--unmerged"])) {
+      core.info(
+        `FORK_NIGHTLY_CONFLICT=${JSON.stringify({
+          fork_base: forkBase,
+          upstream_sha: upstreamSha,
+          upstream_tag: upstream.tag_name,
+        })}`,
+      );
+    }
+    throw error;
+  }
   const sha = git(["rev-parse", "HEAD"]);
   const { data: forkReleases } = await github.rest.repos.listReleases({
     ...context.repo,
