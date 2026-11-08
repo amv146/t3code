@@ -26,12 +26,13 @@ import {
   type ProviderDiffSlice,
   type PullRequestProviderApi,
 } from "@t3tools/source-control-core/server/PullRequestProvider";
-import type {
-  AzureDevOpsChangeEntry,
-  AzureDevOpsItemContent,
-  AzureDevOpsIteration,
-  AzureDevOpsPullRequest,
-  AzureDevOpsRepositoryLocation,
+import {
+  toPullRequestChecks,
+  type AzureDevOpsChangeEntry,
+  type AzureDevOpsItemContent,
+  type AzureDevOpsIteration,
+  type AzureDevOpsPullRequest,
+  type AzureDevOpsRepositoryLocation,
 } from "./azureDevOpsPullRequestJson.ts";
 import { definition } from "../shared/definition.ts";
 
@@ -147,6 +148,31 @@ export const make = Effect.gen(function* () {
         detail: error.detail,
         cause: error,
       });
+
+  /**
+   * The statuses posted on a pull request. They only name and link what its policies already
+   * report, so a failed read leaves the policy checks as they are rather than losing them.
+   */
+  const listStatuses = Effect.fn("AzureDevOpsPullRequestProvider.listStatuses")(function (input: {
+    readonly cwd: string;
+    readonly location: AzureDevOpsRepositoryLocation | null;
+    readonly number: number;
+  }) {
+    return input.location === null
+      ? Effect.succeed([])
+      : cli
+          .listPullRequestStatuses({
+            cwd: input.cwd,
+            location: input.location,
+            number: input.number,
+          })
+          .pipe(
+            Effect.tapError(() =>
+              Effect.logWarning("Azure DevOps pull request statuses could not be read"),
+            ),
+            Effect.orElseSucceed(() => []),
+          );
+  });
 
   const unsupported = (operation: string) =>
     Effect.fail(
@@ -318,6 +344,29 @@ export const make = Effect.gen(function* () {
         Effect.map(toSummary),
       ),
 
+    getChangeRequestChecks: Effect.fn("AzureDevOpsPullRequestProvider.getChangeRequestChecks")(
+      function* (input) {
+        // Policies need only the number, so they read while the pull request is still loading.
+        const [{ pullRequest, statuses }, evaluations] = yield* Effect.all(
+          [
+            readPullRequest(input).pipe(
+              Effect.flatMap((pullRequest) =>
+                listStatuses({
+                  cwd: input.cwd,
+                  location: pullRequest.location,
+                  number: input.number,
+                }).pipe(Effect.map((statuses) => ({ pullRequest, statuses }))),
+              ),
+            ),
+            cli.listPolicyEvaluations({ cwd: input.cwd, number: input.number }),
+          ],
+          { concurrency: "unbounded" },
+        );
+        return { state: pullRequest.state, checks: toPullRequestChecks(evaluations, statuses) };
+      },
+      Effect.mapError(fail("getChangeRequestChecks")),
+    ),
+
     getChangeRequest: Effect.fn("AzureDevOpsPullRequestProvider.getChangeRequest")(
       function* (input) {
         const pullRequest = yield* readPullRequest(input);
@@ -330,10 +379,10 @@ export const make = Effect.gen(function* () {
                 .pipe(Effect.orElseSucceed(() => []));
         // The trial merge's lastMergeSourceCommit can lag behind a new source push.
         const headSha = iterations.at(-1)?.headCommit;
-        const changedFiles =
+        const countChangedFiles =
           location === null
-            ? 0
-            : yield* listLatestChanges({
+            ? Effect.succeed(0)
+            : listLatestChanges({
                 cwd: input.cwd,
                 location,
                 number: input.number,
@@ -342,6 +391,24 @@ export const make = Effect.gen(function* () {
                 Effect.map((listed) => listed.changes.length),
                 Effect.orElseSucceed(() => 0),
               );
+        // Checks are refreshed on their own path too, so a failed read here shows none for now
+        // rather than losing the detail.
+        const readChecks = Effect.all(
+          [
+            cli.listPolicyEvaluations({ cwd: input.cwd, number: input.number }),
+            listStatuses({ cwd: input.cwd, location, number: input.number }),
+          ],
+          { concurrency: "unbounded" },
+        ).pipe(
+          Effect.map(([evaluations, statuses]) => toPullRequestChecks(evaluations, statuses)),
+          Effect.tapError(() =>
+            Effect.logWarning("Azure DevOps pull request checks could not be read"),
+          ),
+          Effect.orElseSucceed(() => []),
+        );
+        const [changedFiles, checks] = yield* Effect.all([countChangedFiles, readChecks], {
+          concurrency: "unbounded",
+        });
         const detail: ProviderChangeRequestDetail = {
           ...toChangeRequest(pullRequest),
           body: pullRequest.body,
@@ -350,7 +417,7 @@ export const make = Effect.gen(function* () {
           mergedAt: pullRequest.state === "merged" ? pullRequest.closedAt : null,
           closedAt: pullRequest.state === "closed" ? pullRequest.closedAt : null,
           reviewers: pullRequest.reviewers,
-          checks: [],
+          checks,
           mergeCapabilities: { merge: true, squash: true, rebase: false },
           viewerPermissions: AZURE_DEVOPS_VIEWER_PERMISSIONS,
           autoMergeEnabled: pullRequest.autoMergeEnabled,
