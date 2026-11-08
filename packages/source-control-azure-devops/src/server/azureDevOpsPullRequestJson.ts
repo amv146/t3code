@@ -496,14 +496,7 @@ function buildResultsUrl(configurationUrl: string | null, buildId: number | null
   return `${configurationUrl.slice(0, apisIndex)}/_build/results?buildId=${buildId}`;
 }
 
-/**
- * Azure's Checks list on a pull request, rebuilt from its branch policy evaluations and the
- * statuses external services posted. Build validation runs pipelines, status policies wait on a
- * posted status and take its description as their name, and the comment policy blocks on open
- * threads. Statuses no policy waits on are listed as optional, as Azure lists them. Reviewer and
- * merge-strategy policies are review state rather than checks, so they are left out as GitHub
- * leaves reviews out of its checks. Required checks come first, then the rest, each by name.
- */
+// Reviewer and merge-strategy policies are review state, not checks in Azure's Checks list.
 export function toPullRequestChecks(
   evaluations: ReadonlyArray<AzureDevOpsPolicyEvaluation>,
   statuses: ReadonlyArray<AzureDevOpsPullRequestStatus>,
