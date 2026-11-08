@@ -215,10 +215,12 @@ describe("getChangeRequest", () => {
           ),
         );
         const input = { cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 };
+        const readPullRequest = provider[method];
+        assert.isDefined(readPullRequest);
         assert.isDefined(provider.getDiffFileContents);
         assert.isDefined(provider.getFileRevisions);
 
-        expect((yield* provider[method](input)).title).toBe("Read 1");
+        expect((yield* readPullRequest(input)).title).toBe("Read 1");
         yield* provider.getDiff(input);
         yield* provider.getDiffFileContents({
           ...input,
@@ -230,7 +232,7 @@ describe("getChangeRequest", () => {
         yield* provider.getChangeRequestActivity(input);
         expect(reads).toBe(1);
 
-        expect((yield* provider[method](input)).title).toBe("Read 2");
+        expect((yield* readPullRequest(input)).title).toBe("Read 2");
         expect(reads).toBe(2);
       }),
   );
@@ -266,6 +268,7 @@ describe("getDiff reads", () => {
 
       const readDiff = (number: number) =>
         provider.getDiff({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number });
+      assert.isDefined(provider.getChangeRequestSummary);
 
       yield* Effect.all([readDiff(7), readDiff(8)], { concurrency: 2 });
 
