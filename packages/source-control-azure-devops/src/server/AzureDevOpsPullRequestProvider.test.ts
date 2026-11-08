@@ -257,6 +257,40 @@ describe("getChangeRequest", () => {
       expect(detail.changedFiles).toBe(1);
     }),
   );
+
+  it.effect.each(["getChangeRequest", "getChangeRequestSummary", "getChangeRequestPreview", "getChangeRequestChecks"] as const)(
+    "reads the pull request once for %s, diff and conversation",
+    (operation) =>
+      Effect.gen(function* () {
+        let reads = 0;
+        const provider = yield* make.pipe(
+          Effect.provide(
+            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+              getPullRequest: () =>
+                Effect.sync(() => {
+                  reads += 1;
+                  return PULL_REQUEST;
+                }),
+              listIterations: () => Effect.succeed([ITERATION]),
+              listIterationChanges: () =>
+                Effect.succeed({ changes: [change("a.ts")], truncated: false }),
+              listFilesDiff: () => filesDiffUnavailable,
+              listPolicyEvaluations: () => Effect.succeed([CI_EVALUATION]),
+              listPullRequestStatuses: () => Effect.succeed([]),
+              readItemContent: () => Effect.succeed({ contents: side("new", 2, 4), isBinary: false }),
+              listThreads: () => Effect.succeed([]),
+            }),
+          ),
+        );
+        const input = { cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 };
+        const read = provider[operation];
+        if (read === undefined) return yield* Effect.die(`${operation} was not implemented`);
+        yield* read(input);
+        yield* provider.getDiff(input);
+        yield* provider.getChangeRequestActivity(input);
+        expect(reads).toBe(1);
+      }),
+  );
 });
 
 describe("getChangeRequestChecks", () => {
