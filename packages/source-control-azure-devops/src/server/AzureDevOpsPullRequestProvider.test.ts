@@ -468,7 +468,9 @@ describe("getDiff from the files diff", () => {
         let cursor: string | undefined;
         do {
           const slice = yield* read.diff(cursor);
-          paths.push(...patchedPaths(slice.patch));
+          const slicePaths = patchedPaths(slice.patch);
+          expect(slicePaths).toHaveLength(Math.min(FILES_DIFF_PAGE_SIZE, count - paths.length));
+          paths.push(...slicePaths);
           expect(slice.truncated).toBe(false);
           cursor = slice.nextCursor ?? undefined;
         } while (cursor !== undefined);
@@ -490,7 +492,9 @@ describe("getDiff from the files diff", () => {
       const paths: string[] = [];
       let slices = 0;
       let cursor: string | undefined;
+      let lastCursor: string | undefined;
       do {
+        lastCursor = cursor;
         const slice = yield* read.diff(cursor);
         paths.push(...patchedPaths(slice.patch));
         cursor = slice.nextCursor ?? undefined;
@@ -499,6 +503,9 @@ describe("getDiff from the files diff", () => {
 
       expect(paths).toEqual(files.map((file) => file.change.path));
       expect(slices).toBeGreaterThan(2);
+      expect(read.asks).toEqual([0, FILES_DIFF_PAGE_SIZE]);
+      const lastSlice = yield* read.diff(lastCursor);
+      expect(lastSlice.nextCursor).toBeNull();
       expect(read.asks).toEqual([0, FILES_DIFF_PAGE_SIZE]);
     }),
   );
@@ -527,6 +534,30 @@ describe("getDiff from the files diff", () => {
       const slice = yield* read.diff(`${ITERATION.id}:2:d`);
 
       expect(slice).toEqual({ patch: "", truncated: true, nextCursor: null });
+    }),
+  );
+
+  it.effect("finishes the held iteration after a push and truncates at the next page", () =>
+    Effect.gen(function* () {
+      const iterations = [ITERATION];
+      const lines = ["z".repeat(MAX_DIFF_SLICE_BYTES)];
+      const files = Array.from({ length: FILES_DIFF_PAGE_SIZE + 1 }, (_, at) =>
+        newFile(`src/file-${String(at).padStart(4, "0")}.ts`, lines),
+      );
+      const read = yield* filesDiffProvider({ files, iterations });
+      const first = yield* read.diff();
+      expect(first.nextCursor).toBe(`${ITERATION.id}:1:d`);
+      iterations.push({ ...ITERATION, id: ITERATION.id + 1, headCommit: "new-head" });
+
+      const held = yield* read.diff(first.nextCursor ?? undefined);
+      expect(patchedPaths(held.patch)).toEqual(["src/file-0001.ts"]);
+      expect(held.nextCursor).toBe(`${ITERATION.id}:2:d`);
+      expect(held.truncated).toBe(false);
+      expect(read.asks).toEqual([0]);
+
+      const nextPage = yield* read.diff(`${ITERATION.id}:${FILES_DIFF_PAGE_SIZE}:d`);
+      expect(nextPage).toEqual({ patch: "", truncated: true, nextCursor: null });
+      expect(read.asks).toEqual([0, FILES_DIFF_PAGE_SIZE]);
     }),
   );
 
