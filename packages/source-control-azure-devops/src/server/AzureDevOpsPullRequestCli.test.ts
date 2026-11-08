@@ -889,6 +889,44 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
     }),
   );
 
+  it.effect("reads a pull request's policies, and nothing when none apply", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output("")));
+      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+
+      const evaluations = yield* cli.listPolicyEvaluations({ cwd: "/w", number: 42 });
+
+      expect(evaluations).toEqual([]);
+      expect(argsOfCall(0).slice(0, 4)).toEqual(["repos", "pr", "policy", "list"]);
+      expect(argsOfCall(0)).toContain("42");
+    }),
+  );
+
+  it.effect("reads only the status fields the checks use", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(
+          output(
+            json({
+              value: [{ id: 1, state: "succeeded", description: "Build", context: { name: "ci" } }],
+            }),
+          ),
+        ),
+      );
+      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+
+      const statuses = yield* cli.listPullRequestStatuses({
+        cwd: "/w",
+        location: { project: "platform", repository: "web" },
+        number: 42,
+      });
+
+      expect(statuses.map((status) => status.description)).toEqual(["Build"]);
+      // A status carries every identity Azure knows of it, which is most of a large response.
+      expect(argsOfCall(0)).toContain("--query");
+    }),
+  );
+
   it.effect("refuses a reviewer az would read as a flag, before running anything", () =>
     Effect.gen(function* () {
       const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
