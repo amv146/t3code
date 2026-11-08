@@ -268,8 +268,6 @@ describe("getDiff reads", () => {
 
       const readDiff = (number: number) =>
         provider.getDiff({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number });
-      assert.isDefined(provider.getChangeRequestSummary);
-
       yield* Effect.all([readDiff(7), readDiff(8)], { concurrency: 2 });
 
       expect(peakInFlight).toBeLessThanOrEqual(MAX_DIFF_SPAWNS);
@@ -389,6 +387,8 @@ describe("what one diff slice spends", () => {
 
         const readDiff = (number: number) =>
           provider.getDiff({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number });
+        const readSummary = provider.getChangeRequestSummary;
+        assert.isDefined(readSummary);
 
         yield* readDiff(HOT);
         for (let filled = 0; filled < LOCATION_CACHE_CAPACITY; filled += 1) {
@@ -396,7 +396,7 @@ describe("what one diff slice spends", () => {
           if (method === "diff") {
             yield* readDiff(HOT);
           } else {
-            yield* provider.getChangeRequestSummary({
+            yield* readSummary({
               cwd: "/w",
               repository: "acme/web",
               host: "dev.azure.com",
