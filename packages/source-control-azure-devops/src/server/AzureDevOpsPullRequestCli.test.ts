@@ -136,7 +136,9 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
             ),
           ),
         )
-        .mockReturnValueOnce(Effect.succeed(output(json({ changeEntries: [] }))));
+        .mockReturnValueOnce(Effect.succeed(output(json({ changeEntries: [] }))))
+        .mockReturnValueOnce(Effect.succeed(output("[]")))
+        .mockReturnValueOnce(Effect.succeed(output(json({ value: [] }))));
       const provider = yield* AzureDevOpsPullRequestProvider.make;
       const detail = yield* provider.getChangeRequest({
         cwd: "/w",
@@ -147,7 +149,7 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
 
       expect(detail.headSha).toBe(latestHead);
       expect(argsOfCall(2)).toContain("iterationId=2");
-      expect(mockedExecute).toHaveBeenCalledTimes(3);
+      expect(mockedExecute).toHaveBeenCalledTimes(5);
     }),
   );
 
@@ -886,6 +888,44 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       const error = yield* Effect.flip(cli.getPullRequest({ cwd: "/w", number: 42 }));
 
       assert.strictEqual(error._tag, "AzureDevOpsPullRequestIncompleteError");
+    }),
+  );
+
+  it.effect("reads a pull request's policies, and nothing when none apply", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output("")));
+      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+
+      const evaluations = yield* cli.listPolicyEvaluations({ cwd: "/w", number: 42 });
+
+      expect(evaluations).toEqual([]);
+      expect(argsOfCall(0).slice(0, 4)).toEqual(["repos", "pr", "policy", "list"]);
+      expect(argsOfCall(0)).toContain("42");
+    }),
+  );
+
+  it.effect("reads only the status fields the checks use", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(
+          output(
+            json({
+              value: [{ id: 1, state: "succeeded", description: "Build", context: { name: "ci" } }],
+            }),
+          ),
+        ),
+      );
+      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+
+      const statuses = yield* cli.listPullRequestStatuses({
+        cwd: "/w",
+        location: { project: "platform", repository: "web" },
+        number: 42,
+      });
+
+      expect(statuses.map((status) => status.description)).toEqual(["Build"]);
+      // A status carries every identity Azure knows of it, which is most of a large response.
+      expect(argsOfCall(0)).toContain("--query");
     }),
   );
 
