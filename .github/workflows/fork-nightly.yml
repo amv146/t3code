@@ -1,0 +1,248 @@
+name: Fork nightly
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: fork-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository == 'amv146/t3code' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      build: ${{ steps.prepare.outputs.build }}
+      sha: ${{ steps.prepare.outputs.sha }}
+      upstream_sha: ${{ steps.prepare.outputs.upstream_sha }}
+      upstream_tag: ${{ steps.prepare.outputs.upstream_tag }}
+      version: ${{ steps.prepare.outputs.version }}
+    steps:
+      - name: Check fork sync credential
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$FORK_SYNC_TOKEN" ]]; then
+            echo "::error::Set FORK_SYNC_TOKEN to a token for this fork with Contents and Workflows write permission."
+            exit 1
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+      - name: Check sync logic
+        run: node --test .github/scripts/fork-nightly.test.cjs
+      - name: Merge the latest published upstream nightly
+        id: prepare
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { prepareForkNightly } = require('./.github/scripts/fork-nightly.cjs');
+            await prepareForkNightly({ github, context, core });
+
+  bundle:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      clerk_publishable_key: ${{ steps.config.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ steps.config.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ steps.config.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ steps.config.outputs.relay_url }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - uses: ./.github/actions/setup-ci-deps
+      - name: Check fork changes against the upstream nightly
+        env:
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          node --test .github/scripts/fork-nightly.test.cjs
+          vp run check:changed "$UPSTREAM_SHA"
+      - name: Load public T3 Connect configuration
+        id: config
+        run: |
+          node --env-file=.env.example -e '
+            const fs = require("node:fs");
+            for (const name of ["CLERK_PUBLISHABLE_KEY", "CLERK_JWT_TEMPLATE", "CLERK_CLI_OAUTH_CLIENT_ID", "RELAY_URL"]) {
+              const value = process.env[`T3CODE_${name}`];
+              if (!value || /[\r\n]/.test(value)) throw new Error(`Missing or invalid public configuration: ${name}`);
+              fs.appendFileSync(process.env.GITHUB_ENV, `T3CODE_${name}=${value}\n`);
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `${name.toLowerCase()}=${value}\n`);
+            }
+          '
+      - name: Align package versions
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Build server, web, and desktop bundles
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: vp run build:desktop
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  wsl:
+    name: Build Linux x64
+    needs: [sync, bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      T3CODE_RELAY_URL: ${{ needs.bundle.outputs.relay_url }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/scripts...
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: js-bundle
+          path: apps
+      - name: Align package versions
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+      - name: Build resource monitor
+        run: |
+          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+          mkdir -p "$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$RUNNER_TEMP/cli-resource-monitor/linux-x64/"
+      - name: Install archive build libraries
+        run: sudo apt-get update && sudo apt-get install -y patchelf libsecret-1-dev pkg-config
+      - name: Build matching WSL runtime
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: |
+          node scripts/apply-web-brand-assets.ts nightly apps/server/dist/client
+          node apps/server/scripts/cli.ts build-exe --verbose
+          node scripts/build-cli-archive.ts --platform linux --arch x64 --version "$VERSION" --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" --output-dir release-cli
+          node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cli-linux-x64
+          path: release-cli/*
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    needs: [sync, bundle, wsl]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-desktop.yml
+    secrets:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
+    with:
+      label: Windows x64
+      runner: ubuntu-latest
+      verify_runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+      cli_archive: false
+      version: ${{ needs.sync.outputs.version }}
+      ref: ${{ needs.sync.outputs.sha }}
+      release_channel: nightly
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
+
+  publish:
+    needs: [sync, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.sync.outputs.version }}
+      SOURCE_SHA: ${{ needs.sync.outputs.sha }}
+      UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+      UPSTREAM_TAG: ${{ needs.sync.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: desktop-win-x64
+          path: release
+      - name: Verify update feed and source
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$SOURCE_SHA"
+          mv release/nightly-win-x64.yml release/nightly.yml
+          grep -Fx "version: $VERSION" release/nightly.yml
+          test "$(find release -maxdepth 1 -name '*.exe' | wc -l)" -eq 1
+          test "$(find release -maxdepth 1 -name '*.blockmap' | wc -l)" -ge 1
+          node -e 'const fs = require("node:fs"); const { forkReleaseBody } = require("./.github/scripts/fork-nightly.cjs"); fs.writeFileSync("release-notes.txt", forkReleaseBody(process.env.UPSTREAM_TAG, process.env.UPSTREAM_SHA, process.env.SOURCE_SHA));'
+      - name: Publish complete fork nightly
+        run: |
+          set -euo pipefail
+          existing="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"v$VERSION\") | [.draft, .target_commitish] | @tsv")"
+          if [[ -n "$existing" ]]; then
+            read -r draft target <<< "$existing"
+            if [[ "$draft" != true || "$target" != "$SOURCE_SHA" ]]; then
+              echo "::error::The release version already belongs to a different or published build. Start a new workflow run."
+              exit 1
+            fi
+            gh release upload "v$VERSION" release/*.exe release/*.blockmap release/nightly.yml --clobber
+          else
+            gh release create "v$VERSION" release/*.exe release/*.blockmap release/nightly.yml \
+              --target "$SOURCE_SHA" --title "T3 Code Fork Nightly $VERSION" \
+              --notes-file release-notes.txt --draft --prerelease --latest=false
+          fi
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$SOURCE_SHA"
+          gh release edit "v$VERSION" --draft=false --prerelease --latest=false
+          echo "Install or update from https://github.com/$GH_REPO/releases/tag/v$VERSION" >> "$GITHUB_STEP_SUMMARY"
