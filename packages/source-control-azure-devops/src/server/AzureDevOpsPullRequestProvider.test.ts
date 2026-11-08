@@ -1,4 +1,4 @@
-import { describe, expect, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -188,33 +188,51 @@ describe("getChangeRequest", () => {
       }),
   );
 
-  it.effect("reads the pull request once for its detail, diff and conversation", () =>
-    Effect.gen(function* () {
-      let reads = 0;
-      const provider = yield* make.pipe(
-        Effect.provide(
-          Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
-            getPullRequest: () =>
-              Effect.sync(() => {
-                reads += 1;
-                return PULL_REQUEST;
-              }),
-            listIterations: () => Effect.succeed([ITERATION]),
-            listIterationChanges: () =>
-              Effect.succeed({ changes: [change("a.ts")], truncated: false }),
-            readItemContent: () => Effect.succeed({ contents: side("new", 2, 4), isBinary: false }),
-            listThreads: () => Effect.succeed([]),
-          }),
-        ),
-      );
-      const input = { cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 };
+  it.effect.each([
+    "getChangeRequest",
+    "getChangeRequestSummary",
+    "getChangeRequestPreview",
+  ] as const)(
+    "%s seeds the location for diff, file and conversation reads without caching live details",
+    (method) =>
+      Effect.gen(function* () {
+        let reads = 0;
+        const provider = yield* make.pipe(
+          Effect.provide(
+            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+              getPullRequest: () =>
+                Effect.sync(() => {
+                  reads += 1;
+                  return { ...PULL_REQUEST, title: `Read ${reads}` };
+                }),
+              listIterations: () => Effect.succeed([ITERATION]),
+              listIterationChanges: () =>
+                Effect.succeed({ changes: [change("a.ts")], truncated: false }),
+              readItemContent: () =>
+                Effect.succeed({ contents: side("new", 2, 4), isBinary: false }),
+              listThreads: () => Effect.succeed([]),
+            }),
+          ),
+        );
+        const input = { cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 };
+        assert.isDefined(provider.getDiffFileContents);
+        assert.isDefined(provider.getFileRevisions);
 
-      yield* provider.getChangeRequest(input);
-      yield* provider.getDiff(input);
-      yield* provider.getChangeRequestActivity(input);
+        expect((yield* provider[method](input)).title).toBe("Read 1");
+        yield* provider.getDiff(input);
+        yield* provider.getDiffFileContents({
+          ...input,
+          oldPath: "a.ts",
+          newPath: "a.ts",
+          changeType: "change",
+        });
+        yield* provider.getFileRevisions({ ...input, paths: ["a.ts"] });
+        yield* provider.getChangeRequestActivity(input);
+        expect(reads).toBe(1);
 
-      expect(reads).toBe(1);
-    }),
+        expect((yield* provider[method](input)).title).toBe("Read 2");
+        expect(reads).toBe(2);
+      }),
   );
 });
 
@@ -342,37 +360,52 @@ describe("what one diff slice spends", () => {
       expect(read.slice.nextCursor).toBe(`${ITERATION.id}:4`);
     }),
   );
-  it.effect("keeps the pull request being read, not the one looked up first", () =>
-    Effect.gen(function* () {
-      const HOT = 7;
-      const readsOf = new Map<number, number>();
+  it.effect.each(["diff", "summary"] as const)(
+    "keeps the pull request being read by %s, not the one looked up first",
+    (method) =>
+      Effect.gen(function* () {
+        const HOT = 7;
+        const readsOf = new Map<number, number>();
 
-      const provider = yield* make.pipe(
-        Effect.provide(
-          Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
-            getPullRequest: (input) =>
-              Effect.sync(() => {
-                readsOf.set(input.number, (readsOf.get(input.number) ?? 0) + 1);
-                return { ...PULL_REQUEST, number: input.number };
-              }),
-            listIterations: () => Effect.succeed([ITERATION]),
-            listIterationChanges: () =>
-              Effect.succeed({ changes: [change("a.ts")], truncated: false }),
-            readItemContent: () => Effect.succeed({ contents: side("new", 2, 4), isBinary: false }),
-          }),
-        ),
-      );
+        const provider = yield* make.pipe(
+          Effect.provide(
+            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+              getPullRequest: (input) =>
+                Effect.sync(() => {
+                  readsOf.set(input.number, (readsOf.get(input.number) ?? 0) + 1);
+                  return { ...PULL_REQUEST, number: input.number };
+                }),
+              listIterations: () => Effect.succeed([ITERATION]),
+              listIterationChanges: () =>
+                Effect.succeed({ changes: [change("a.ts")], truncated: false }),
+              readItemContent: () =>
+                Effect.succeed({ contents: side("new", 2, 4), isBinary: false }),
+            }),
+          ),
+        );
 
-      const readDiff = (number: number) =>
-        provider.getDiff({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number });
+        const readDiff = (number: number) =>
+          provider.getDiff({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number });
 
-      yield* readDiff(HOT);
-      for (let filled = 0; filled < LOCATION_CACHE_CAPACITY; filled += 1) {
-        yield* readDiff(HOT + 1 + filled);
         yield* readDiff(HOT);
-      }
+        for (let filled = 0; filled < LOCATION_CACHE_CAPACITY; filled += 1) {
+          yield* readDiff(HOT + 1 + filled);
+          if (method === "diff") {
+            yield* readDiff(HOT);
+          } else {
+            yield* provider.getChangeRequestSummary({
+              cwd: "/w",
+              repository: "acme/web",
+              host: "dev.azure.com",
+              number: HOT,
+            });
+          }
+        }
 
-      expect(readsOf.get(HOT)).toBe(1);
-    }),
+        yield* readDiff(HOT);
+        expect(readsOf.get(HOT)).toBe(method === "diff" ? 1 : LOCATION_CACHE_CAPACITY + 1);
+        yield* readDiff(HOT + 1);
+        expect(readsOf.get(HOT + 1)).toBe(2);
+      }),
   );
 });

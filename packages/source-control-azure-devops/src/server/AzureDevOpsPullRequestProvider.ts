@@ -163,21 +163,21 @@ export const make = Effect.gen(function* () {
   // PR locations are immutable; every pull request read records one so later reads can skip it.
   const locations = new Map<string, AzureDevOpsRepositoryLocation>();
 
-  const readPullRequest = (input: { readonly cwd: string; readonly number: number }) =>
-    cli.getPullRequest({ cwd: input.cwd, number: input.number }).pipe(
-      Effect.map((pullRequest) => {
-        const location = pullRequest.location;
-        if (location === null) return pullRequest;
-        const key = `${input.cwd} ${input.number}`;
-        locations.delete(key);
-        if (locations.size >= LOCATION_CACHE_CAPACITY) {
-          const oldest = locations.keys().next().value;
-          if (oldest !== undefined) locations.delete(oldest);
-        }
-        locations.set(key, location);
-        return pullRequest;
-      }),
-    );
+  const readPullRequest = Effect.fn("AzureDevOpsPullRequestProvider.readPullRequest")(
+    function* (input: { readonly cwd: string; readonly number: number }) {
+      const pullRequest = yield* cli.getPullRequest({ cwd: input.cwd, number: input.number });
+      const location = pullRequest.location;
+      if (location === null) return pullRequest;
+      const key = `${input.cwd} ${input.number}`;
+      locations.delete(key);
+      if (locations.size >= LOCATION_CACHE_CAPACITY) {
+        const oldest = locations.keys().next().value;
+        if (oldest !== undefined) locations.delete(oldest);
+      }
+      locations.set(key, location);
+      return pullRequest;
+    },
+  );
 
   const locationOf = (input: { readonly cwd: string; readonly number: number }) => {
     const key = `${input.cwd} ${input.number}`;
