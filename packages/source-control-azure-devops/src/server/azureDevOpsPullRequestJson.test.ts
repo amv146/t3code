@@ -847,26 +847,43 @@ describe("toPullRequestChecks", () => {
     ]);
   });
 
-  it("reads a manual-only build nobody queued as skipped rather than pending forever", () => {
-    const checks = checksFor([
-      policy({
-        status: "queued",
-        settings: { manualQueueOnly: true, displayName: "Optional perf" },
-      }),
-      policy({
-        status: "queued",
-        settings: { manualQueueOnly: true, displayName: "Queued perf" },
-        context: { buildId: 9 },
-      }),
-      policy({ status: "notApplicable", settings: { displayName: "Docs" } }),
-      policy({ status: "broken", settings: { displayName: "Broken" } }),
-    ]);
+  it.each([undefined, null, 0, -1, 1.5])(
+    "reads a manual-only build with no valid run (%s) as skipped rather than pending forever",
+    (buildId) => {
+      const checks = checksFor([
+        policy({
+          status: "queued",
+          settings: { displayName: "Awaiting run" },
+          context: { buildId: 0 },
+        }),
+        policy({
+          status: "queued",
+          settings: { manualQueueOnly: true, displayName: "Optional perf" },
+          context: { buildId },
+        }),
+        policy({
+          status: "queued",
+          settings: { manualQueueOnly: true, displayName: "Queued perf" },
+          context: { buildId: 9 },
+        }),
+        policy({ status: "notApplicable", settings: { displayName: "Docs" } }),
+        policy({ status: "broken", settings: { displayName: "Broken" } }),
+      ]);
 
-    expect(checks.map((check) => [check.name, check.status, check.description])).toEqual([
-      ["Broken", "failure", null],
-      ["Docs", "skipped", null],
-      ["Optional perf", "skipped", "Not run"],
-      ["Queued perf", "pending", null],
-    ]);
-  });
+      expect(
+        checks.map((check) => [check.name, check.status, check.description, check.url]),
+      ).toEqual([
+        ["Awaiting run", "pending", null, null],
+        ["Broken", "failure", null, null],
+        ["Docs", "skipped", null, null],
+        ["Optional perf", "skipped", "Not run", null],
+        [
+          "Queued perf",
+          "pending",
+          null,
+          "https://dev.azure.com/acme/6f9c9b7f-0000-0000-0000-000000000000/_build/results?buildId=9",
+        ],
+      ]);
+    },
+  );
 });
