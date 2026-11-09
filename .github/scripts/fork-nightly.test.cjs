@@ -6,7 +6,6 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   alreadyPublished,
-  forkReleaseBody,
   prepareForkNightly,
   resolveForkVersion,
   selectLatestNightly,
@@ -59,7 +58,7 @@ test("keeps the nightly version shape and makes successive fork builds orderable
 
 test("only deduplicates a published build of the exact fork commit with an update feed", () => {
   const release = nightly({
-    body: forkReleaseBody(upstreamTag, upstreamSha, sha),
+    body: `<!-- fork-nightly-source:${sha} -->`,
     assets: [{ name: "nightly.yml" }],
   });
   assert.equal(alreadyPublished([release], sha), true);
@@ -149,6 +148,88 @@ function prepareFixture(fork, releases = []) {
   );
 }
 
+function releaseBodyFixture(fork, options) {
+  return execFileSync(
+    process.execPath,
+    [
+      "-e",
+      `const { forkReleaseBody } = require(${JSON.stringify(path.join(__dirname, "fork-nightly.cjs"))});
+       const options = ${JSON.stringify(options)};
+       process.stdout.write(forkReleaseBody(${JSON.stringify(upstreamTag)}, options.upstreamSha, options.sha, options));`,
+    ],
+    { cwd: fork, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+}
+
+test("release notes combine new upstream and fork commits without setup text or merge noise", (t) => {
+  const { fork, before, git } = gitFixture(t, false);
+  const previousSha = git(fork, "rev-parse", `${before}^`);
+  const outputs = JSON.parse(prepareFixture(fork).split("FORK_OUTPUTS=")[1]);
+  for (let index = 1; index <= 8; index += 1) {
+    git(fork, "commit", "--allow-empty", "-m", `fix(web): fork change ${index}`);
+  }
+  const source = git(fork, "rev-parse", "HEAD");
+  const previous = nightly({
+    tag_name: "v0.1.8-nightly.20261107.12345678900",
+    body: `<!-- fork-nightly-source:${previousSha} -->`,
+    assets: [{ name: "nightly.yml" }],
+  });
+  const current = nightly({
+    tag_name: `v${outputs.version}`,
+    body: `<!-- fork-nightly-source:${source} -->`,
+    assets: [{ name: "nightly.yml" }],
+    published_at: "2026-11-08T06:00:00Z",
+  });
+  const options = {
+    version: outputs.version,
+    upstreamSha: outputs.upstream_sha,
+    sha: source,
+    releases: [
+      { ...previous, draft: true, published_at: "2026-11-09T05:00:00Z" },
+      { ...previous, assets: [], published_at: "2026-11-09T05:00:00Z" },
+      nightly({
+        tag_name: "v0.1.8-nightly.20261110.12345678902",
+        body: `<!-- fork-nightly-source:${"f".repeat(40)} -->`,
+        assets: [{ name: "nightly.yml" }],
+        published_at: "2026-11-10T05:00:00Z",
+      }),
+      previous,
+      current,
+    ],
+  };
+  const body = releaseBodyFixture(fork, options);
+  const summary = body.split("<details>")[0];
+  assert.ok(summary.includes(`**v${outputs.version}** · 10 changes from 1 contributor`));
+  assert.equal(summary.split("\n").filter((line) => line.startsWith("- ")).length, 7);
+  assert.match(summary, /fork change 8/);
+  assert.match(summary, /### Plus 3 more changes\./);
+  assert.match(body, /Personal feature/);
+  assert.match(body, /Upstream nightly/);
+  assert.match(body, new RegExp(`https://github.com/amv146/t3code/commit/${before}`));
+  assert.match(body, new RegExp(`https://github.com/amv146/t3code/commit/${outputs.upstream_sha}`));
+  assert.match(body, new RegExp(`<!-- fork-nightly-source:${source} -->`));
+  assert.doesNotMatch(
+    body,
+    /Install the|unsigned|Upstream commit:|Fork commit:|Merge upstream|Base/,
+  );
+
+  const initialBody = releaseBodyFixture(fork, { ...options, releases: [] });
+  assert.match(initialBody, /Personal feature/);
+  assert.doesNotMatch(initialBody, /- Upstream nightly/);
+  assert.match(
+    releaseBodyFixture(fork, { ...options, sha: git(fork, "rev-parse", "HEAD~2") }),
+    /### Plus 1 more change\./,
+  );
+
+  const unrelated = "f".repeat(40);
+  assert.throws(() =>
+    releaseBodyFixture(fork, {
+      ...options,
+      releases: [{ ...previous, body: `<!-- fork-nightly-source:${unrelated} -->` }],
+    }),
+  );
+});
+
 test("merges and pushes the nightly without losing personal commits, then skips an unchanged release", (t) => {
   const { fork, remote, upstream, git } = gitFixture(t, false);
   const output = prepareFixture(fork);
@@ -159,7 +240,7 @@ test("merges and pushes the nightly without losing personal commits, then skips 
   assert.equal(fs.readFileSync(path.join(fork, "personal.txt"), "utf8"), "personal feature\n");
   assert.equal(fs.readFileSync(path.join(fork, "upstream.txt"), "utf8"), "nightly update\n");
   const release = nightly({
-    body: forkReleaseBody(upstreamTag, outputs.upstream_sha, outputs.sha),
+    body: `<!-- fork-nightly-source:${outputs.sha} -->`,
     assets: [{ name: "nightly.yml" }],
   });
   const rerun = JSON.parse(prepareFixture(fork, [release]).split("FORK_OUTPUTS=")[1]);

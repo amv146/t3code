@@ -12,6 +12,12 @@ desktop update feed. Keep **Nightly** selected in the app. Future fork releases
 appear in the normal update UI; official nightly installers still use the
 upstream feed and would replace your changes.
 
+**What's changed** lists upstream and fork commits since the previous published
+fork nightly, without merge commits or installer instructions. Like upstream,
+the popup shows a compact summary and change/contributor counts; GitHub keeps the
+full commit list folded below it. The first fork release lists changes against
+its upstream nightly. Notes are generated from Git history without a paid model.
+
 Add fixes and features to this fork's `main` through normal commits or pull
 requests. The **Fork PR validation** check runs the changed-file checks on
 GitHub-hosted runners, including Chromium for browser tests; upstream CI uses

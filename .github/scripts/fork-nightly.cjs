@@ -29,28 +29,88 @@ function sourceMarker(sha) {
   return `<!-- fork-nightly-source:${sha} -->`;
 }
 
-function alreadyPublished(releases, sha) {
-  return releases.some(
-    (release) =>
-      !release.draft &&
-      release.prerelease &&
-      nightlyPattern.test(release.tag_name) &&
-      release.body?.includes(sourceMarker(sha)) &&
-      release.assets?.some((asset) => asset.name === "nightly.yml"),
+function isPublishedForkNightly(release) {
+  return (
+    !release.draft &&
+    release.prerelease &&
+    nightlyPattern.test(release.tag_name) &&
+    release.assets?.some((asset) => asset.name === "nightly.yml")
   );
 }
 
-function forkReleaseBody(upstreamTag, upstreamSha, sha) {
+function alreadyPublished(releases, sha) {
+  return releases.some(
+    (release) => isPublishedForkNightly(release) && release.body?.includes(sourceMarker(sha)),
+  );
+}
+
+function forkReleaseBody(upstreamTag, upstreamSha, sha, { version, releases }) {
+  const marker = sourceMarker(sha);
+  sourceMarker(upstreamSha);
+  if (!nightlyPattern.test(upstreamTag) || !nightlyPattern.test(`v${version}`)) {
+    throw new Error("Invalid nightly version for release notes.");
+  }
+  const published = releases.filter(isPublishedForkNightly);
+  const current = published.find((release) => release.tag_name === `v${version}`);
+  const previous = published
+    .filter(
+      (release) =>
+        release.tag_name !== `v${version}` &&
+        (!current || Date.parse(release.published_at) < Date.parse(current.published_at)),
+    )
+    .sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at))[0];
+  const previousSha = previous?.body?.match(/<!-- fork-nightly-source:([a-f0-9]{40}) -->/)?.[1];
+  if (previous && !previousSha) {
+    throw new Error(`Missing source commit in previous fork release ${previous.tag_name}.`);
+  }
+  const base = previousSha ?? upstreamSha;
+  const git = (args) => execFileSync("git", args, { encoding: "utf8" }).trim();
+  git(["merge-base", "--is-ancestor", base, sha]);
+  const log = git([
+    "log",
+    "--no-merges",
+    "--reverse",
+    "--format=%H%x1f%s%x1f%an",
+    `${base}..${sha}`,
+  ]);
+  const commits = log
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [commit, subject, author] = line.split("\x1f");
+      return { commit, subject, author };
+    });
+  const contributors = new Set(
+    commits.map(({ author }) => author).filter((author) => !author.endsWith("[bot]")),
+  ).size;
+  const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+  const summary = commits
+    .slice(-7)
+    .toReversed()
+    .map(({ subject }) => `- ${subject.replace(/\s+\(#\d+\)$/, "")}`);
+  const remaining = commits.length - summary.length;
+  const fullChangelog = commits.map(
+    ({ commit, subject }) =>
+      `- ${subject} ([${commit.slice(0, 7)}](https://github.com/amv146/t3code/commit/${commit}))`,
+  );
   return [
-    `Windows x64 build of [${upstreamTag}](https://github.com/pingdotgg/t3code/releases/tag/${upstreamTag}) with the commits on this fork's main branch.`,
+    `**v${version}** · ${plural(commits.length, "change")} from ${plural(contributors, "contributor")}`,
     "",
-    "Install the `.exe` once to switch from official T3 Code to this fork's update feed. Keep the Nightly update channel selected. Later builds appear in the normal desktop update UI.",
+    ...summary,
+    ...(remaining > 0
+      ? ["", `### Plus ${remaining} more ${remaining === 1 ? "change" : "changes"}.`]
+      : []),
     "",
-    "The installer is unsigned unless this fork has its own Windows signing credentials. It includes a matching, smoke-tested Linux runtime for WSL.",
+    "<details>",
+    "<summary>Full changelog</summary>",
     "",
-    `Upstream commit: ${upstreamSha}`,
-    `Fork commit: ${sha}`,
-    sourceMarker(sha),
+    ...fullChangelog,
+    "",
+    `[Compare changes](https://github.com/amv146/t3code/compare/${base}...${sha})`,
+    `[Upstream nightly](https://github.com/pingdotgg/t3code/releases/tag/${upstreamTag})`,
+    "",
+    "</details>",
+    marker,
     "",
   ].join("\n");
 }

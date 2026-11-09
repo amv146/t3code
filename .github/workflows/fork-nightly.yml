@@ -216,6 +216,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: desktop-win-x64
@@ -228,7 +229,23 @@ jobs:
           grep -Fx "version: $VERSION" release/nightly.yml
           test "$(find release -maxdepth 1 -name '*.exe' | wc -l)" -eq 1
           test "$(find release -maxdepth 1 -name '*.blockmap' | wc -l)" -ge 1
-          node -e 'const fs = require("node:fs"); const { forkReleaseBody } = require("./.github/scripts/fork-nightly.cjs"); fs.writeFileSync("release-notes.txt", forkReleaseBody(process.env.UPSTREAM_TAG, process.env.UPSTREAM_SHA, process.env.SOURCE_SHA));'
+      - name: Write combined release notes
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { forkReleaseBody } = require('./.github/scripts/fork-nightly.cjs');
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...context.repo,
+              per_page: 100,
+            });
+            const body = forkReleaseBody(
+              process.env.UPSTREAM_TAG,
+              process.env.UPSTREAM_SHA,
+              process.env.SOURCE_SHA,
+              { version: process.env.VERSION, releases },
+            );
+            fs.writeFileSync('release-notes.txt', body);
       - name: Publish complete fork nightly
         run: |
           set -euo pipefail
@@ -246,5 +263,5 @@ jobs:
               --notes-file release-notes.txt --draft --prerelease --latest=false
           fi
           test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$SOURCE_SHA"
-          gh release edit "v$VERSION" --draft=false --prerelease --latest=false
+          gh release edit "v$VERSION" --notes-file release-notes.txt --draft=false --prerelease --latest=false
           echo "Install or update from https://github.com/$GH_REPO/releases/tag/v$VERSION" >> "$GITHUB_STEP_SUMMARY"
