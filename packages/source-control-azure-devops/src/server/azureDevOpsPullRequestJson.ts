@@ -550,7 +550,11 @@ export function toPullRequestChecks(
       trimmed(context?.buildDefinitionName) ??
       trimmed(configuration.type?.displayName);
     if (name === null) continue;
-    const buildId = context?.buildId ?? null;
+    const reportedBuildId = context?.buildId;
+    const buildId =
+      reportedBuildId != null && Number.isSafeInteger(reportedBuildId) && reportedBuildId > 0
+        ? reportedBuildId
+        : null;
     const neverQueued = settings?.manualQueueOnly === true && buildId === null;
     // An expired build no longer satisfies its policy, and Azure counts it as failed.
     const expired = context?.isExpired === true;
