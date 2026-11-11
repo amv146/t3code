@@ -42,7 +42,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.FORK_SYNC_TOKEN }}
       - name: Check sync logic
-        run: node --test .github/scripts/fork-nightly.test.cjs
+        run: node --test .github/scripts/fork-nightly.test.cjs .github/scripts/fork-dependencies.test.cjs
       - name: Merge the latest published upstream nightly
         id: prepare
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -71,13 +71,32 @@ jobs:
             !/.repos/
           sparse-checkout-cone-mode: false
       - uses: ./.github/actions/setup-ci-deps
+      - uses: ./.github/actions/setup-apt-mirrors
+      - name: Resolve Playwright version
+        id: playwright_version
+        run: echo "version=$(node -p "require('./apps/web/node_modules/playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache Chromium
+        id: chromium_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-shell-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright_version.outputs.version }}
       - name: Install Chromium for changed browser tests
-        run: node apps/web/node_modules/playwright/cli.js install --with-deps --only-shell chromium
+        if: steps.chromium_cache.outputs.cache-hit != 'true'
+        run: node apps/web/node_modules/playwright/cli.js install --only-shell chromium
+      - name: Install missing Chromium system dependencies
+        run: |
+          browser=$(find "$HOME/.cache/ms-playwright" -name chrome-headless-shell -type f -print -quit)
+          test -n "$browser"
+          libraries=$(ldd "$browser")
+          if grep '=> not found' <<< "$libraries"; then
+            node apps/web/node_modules/playwright/cli.js install-deps chromium
+          fi
       - name: Check fork changes against the upstream nightly
         env:
           UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
         run: |
-          node --test .github/scripts/fork-nightly.test.cjs
+          node --test .github/scripts/fork-nightly.test.cjs .github/scripts/fork-dependencies.test.cjs
           vp run check:changed "$UPSTREAM_SHA"
       - name: Load public T3 Connect configuration
         id: config
@@ -148,6 +167,7 @@ jobs:
           cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
           mkdir -p "$RUNNER_TEMP/cli-resource-monitor/linux-x64"
           cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$RUNNER_TEMP/cli-resource-monitor/linux-x64/"
+      - uses: ./.github/actions/setup-apt-mirrors
       - name: Install archive build libraries
         run: sudo apt-get update && sudo apt-get install -y patchelf libsecret-1-dev pkg-config
       - name: Build matching WSL runtime
