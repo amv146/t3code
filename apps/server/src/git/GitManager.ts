@@ -193,7 +193,7 @@ type GitActionProgressPayload = StripProgressContext<GitActionProgressEvent>;
 type GitActionProgressEmitter = (event: GitActionProgressPayload) => Effect.Effect<void, never>;
 
 function isNotGitRepositoryError(error: GitCommandError): boolean {
-  return isNonRepositoryGitStderr(error.message);
+  return error.reason === "not_a_repository" || isNonRepositoryGitStderr(error.message);
 }
 
 interface OpenPrInfo {
