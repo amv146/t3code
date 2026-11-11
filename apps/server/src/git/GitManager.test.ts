@@ -975,6 +975,26 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
+  it.effect("remote status returns null when an unborn repository disappears during lookup", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-unborn-");
+      yield* runGit(repoDir, ["init", "-b", "main"]);
+      const gate = {
+        matches: (args: ReadonlyArray<string>) =>
+          args[0] === "rev-parse" && args[1] === "--symbolic-full-name" && args[2] === "HEAD",
+        reached: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      };
+      const { manager } = yield* makeManager({ gitSpawnGate: gate });
+      const inFlight = yield* manager.remoteStatus({ cwd: repoDir }).pipe(Effect.forkChild);
+      yield* Deferred.await(gate.reached);
+      yield* removePath(NodePath.join(repoDir, ".git"));
+      yield* Deferred.succeed(gate.release, undefined);
+
+      expect(yield* Fiber.join(inFlight)).toBeNull();
+    }),
+  );
+
   it.effect("a git read in flight during a T3 git action does not outlive it", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
@@ -5002,6 +5022,9 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         expect(NodeFS.readFileSync(NodePath.join(repoDir, "untracked.txt"), "utf8")).toBe(
           "keep me\n",
         );
+        expect(
+          (yield* runGit(repoDir, ["config", "branch.feature/pr-safe.t3-pull-request"])).stdout,
+        ).toBe("https://github.com/pingdotgg/codething-mvp/pull/91\n");
       }),
   );
 
