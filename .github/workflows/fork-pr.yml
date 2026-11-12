@@ -58,4 +58,5 @@ jobs:
       - name: Check changes against the target branch
         env:
           BASE: ${{ github.event.pull_request.base.sha || format('origin/{0}', inputs.base) }}
-        run: vp run check:changed "$BASE"
+        # Nightly merges can select hundreds of serial Git/SQLite test files.
+        run: vp run check:changed "$BASE" --timeout 2100

@@ -153,15 +153,7 @@ async function probeForkConflict({ github, context, git = runGit }) {
   };
 }
 
-async function notifyForkConflict({
-  github,
-  context,
-  core,
-  webhookUrl,
-  git,
-  fetchImpl = fetch,
-  dryRun = false,
-}) {
+async function notifyForkConflict({ github, context, core, git, enabled = false, dryRun = false }) {
   const result = await probeForkConflict({ github, context, git });
   if (!result.payload) {
     core.info(result.reason);
@@ -169,52 +161,121 @@ async function notifyForkConflict({
     return result;
   }
   if (dryRun) return result;
-  let endpoint;
-  try {
-    endpoint = new URL(webhookUrl);
-  } catch {
-    throw new Error("Set FORK_CONFLICT_WEBHOOK_URL to the private T3 webhook endpoint.");
+  if (!enabled) {
+    const reason =
+      "Hosted repair is disabled. Configure the credential and spending limit before enabling FORK_COPILOT_REPAIR_ENABLED.";
+    core.info(reason);
+    await core.summary.addRaw(reason).write();
+    return { ...result, reason };
   }
+  const { data: user } = await github.rest.users.getAuthenticated();
+  if (user.login !== repo.owner) {
+    throw new Error(
+      "Hosted repair must authenticate as amv146 to use the intended Copilot account.",
+    );
+  }
+  const pulls = await github.paginate(github.rest.pulls.list, {
+    ...repo,
+    state: "open",
+    base: "main",
+    per_page: 100,
+  });
+  const pending = pulls.find(
+    (pull) =>
+      /^fork\/nightly-repair\/[a-f0-9]{40}-[a-f0-9]{40}$/.test(pull.head.ref) &&
+      pull.head.ref.endsWith(`-${result.payload.upstream_sha}`),
+  );
+  if (pending) {
+    const reason = `Existing upstream repair PR: ${pending.html_url}. Reuse it even though fork main advanced; do not start a second repair for the same upstream revision.`;
+    core.info(reason);
+    await core.summary.addRaw(reason).write();
+    return { ...result, reason, pullRequestUrl: pending.html_url };
+  }
+  const key = `${result.payload.fork_base}-${result.payload.upstream_sha}`;
+  const title = `Nightly repair: ${key}`;
+  const issues = await github.paginate(github.rest.issues.listForRepo, {
+    ...repo,
+    state: "all",
+    creator: repo.owner,
+    per_page: 100,
+  });
+  const existing = issues.filter(
+    (issue) =>
+      !issue.pull_request &&
+      (issue.title === title ||
+        issue.body?.split("\n").includes(`Repair key: ${key}`) ||
+        (issue.state === "open" &&
+          issue.body?.split("\n").includes(`Upstream commit: ${result.payload.upstream_sha}`))),
+  );
+  if (existing.length > 0) {
+    const reason = `Repair issue already exists: ${existing[0].html_url}. Inspect its assignment and PR; no second agent will be started, even if the issue was closed or the first dispatch was interrupted.`;
+    core.info(reason);
+    await core.summary.addRaw(reason).write();
+    return { ...result, reason, issueUrl: existing[0].html_url };
+  }
+  const actors = await github.graphql(
+    `query($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+          nodes { login __typename ... on Bot { id } }
+        }
+      }
+    }`,
+    { owner: repo.owner, name: repo.repo },
+  );
+  const copilot = actors.repository?.suggestedActors.nodes.find(
+    (actor) => actor.__typename === "Bot" && actor.login === "copilot-swe-agent",
+  );
+  if (!copilot) {
+    throw new Error("Copilot cloud agent is not available for this account and repository.");
+  }
+  const {
+    fork_base: forkBase,
+    upstream_sha: upstreamSha,
+    upstream_tag: upstreamTag,
+    run_id: runId,
+  } = result.payload;
+  const body = [
+    `Resolve the verified upstream nightly merge conflict in ${repository}.`,
+    "",
+    `Failed run: https://github.com/${repository}/actions/runs/${runId}`,
+    `Fork base: ${forkBase}`,
+    `Upstream nightly: ${upstreamTag}`,
+    `Upstream commit: ${upstreamSha}`,
+    "",
+    "Work only in this fork. Reconfirm live main, the failed run, and the latest published pingdotgg/t3code nightly before changing anything. Stop and report if these inputs are stale or the conflict no longer reproduces.",
+    `Fetch refs/tags/${upstreamTag} from https://github.com/pingdotgg/t3code.git and verify it resolves to ${upstreamSha}. Fetch complete fork history if the checkout is shallow.`,
+    `Create a normal two-parent merge of ${upstreamSha} into ${forkBase} on your repair branch. Preserve both parents and all contributor history. Do not squash, rebase, force-push, copy an upstream snapshot, or choose blanket ours/theirs.`,
+    "Resolve narrowly and preserve the fork's current ADO checks, location cache, paged file diffs, composer completion, glass opacity, release notes, and CI/repair automation. Do not discard fork behavior just to make the merge pass.",
+    "Add focused regression coverage for changed behavior and run vp run check:changed against the verified fork base plus relevant focused tests. Do not bypass quality gates, change billing, trigger paid review services, or start other agents.",
+    "Open one repair PR targeting main. Include the failed run, both source SHAs, resolved files, and exact validation results. Verify both input commits are ancestors of the PR head. If your environment cannot preserve a two-parent merge, stop and report instead of presenting a patch-only PR as a completed repair.",
+    "A human must review and merge the PR using a merge commit, not squash/rebase. Do not approve or merge it yourself, push main, or change branch policies. Publication remains the normal nightly workflow's job.",
+    "",
+    `Repair key: ${forkBase}-${upstreamSha}`,
+  ].join("\n");
+  // The workflow serializes dispatches; the issue survives an ambiguous API response without a second assignment.
+  const { data: issue } = await github.rest.issues.create({
+    ...repo,
+    title,
+    body,
+    assignees: ["copilot-swe-agent[bot]"],
+    agent_assignment: { target_repo: repository, base_branch: "main" },
+  });
   if (
-    endpoint.origin !== "https://relay.t3.codes" ||
-    !endpoint.pathname.startsWith("/v1/hooks/") ||
-    endpoint.username ||
-    endpoint.password ||
-    endpoint.search ||
-    endpoint.hash
+    !issue.assignees?.some(
+      (actor) =>
+        actor.node_id === copilot.id ||
+        ["copilot-swe-agent", "copilot-swe-agent[bot]"].includes(actor.login),
+    )
   ) {
-    throw new Error("Conflict delivery requires a T3 Connect webhook endpoint.");
+    throw new Error(
+      `GitHub did not assign Copilot to ${issue.html_url}. Inspect the issue; dispatch will not be retried automatically.`,
+    );
   }
-  let response;
-  try {
-    response = await fetchImpl(endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(result.payload),
-      redirect: "error",
-      signal: AbortSignal.timeout(20_000),
-    });
-  } catch {
-    // Fetch errors can include the credential-bearing URL.
-    throw new Error("T3 conflict webhook delivery failed. Inspect the task's delivery log.");
-  }
-  const outcome = response.headers.get("x-t3-hook-outcome");
-  if (
-    response.status !== 202 ||
-    (outcome !== null && !["accepted", "duplicate", "coalesced"].includes(outcome))
-  ) {
-    throw new Error(`T3 did not accept the conflict delivery (HTTP ${response.status}).`);
-  }
-  const receipt = await response.json();
-  const held = receipt.queued === true;
-  if (!held && (typeof receipt.deliveryId !== "string" || !receipt.deliveryId)) {
-    throw new Error("T3 returned no conflict delivery receipt.");
-  }
-  // The public relay strips the outcome header; its receipt does not prove agent dispatch.
-  const message = `${held ? "T3 relay queued" : "T3 received"} the conflict notification. Confirm dispatch in its delivery log. A ready repair PR needs user merge approval to unblock nightly sync.`;
+  const message = `Copilot repair assigned: ${issue.html_url}. A human must approve workflow runs if required and merge the repair PR when ready. Assignment is not proof that repair or publication completed.`;
   core.info(message);
   await core.summary.addRaw(message).write();
-  return result;
+  return { ...result, issueUrl: issue.html_url };
 }
 
 module.exports = { conflictMetadata, notifyForkConflict, probeForkConflict, repairBranch };

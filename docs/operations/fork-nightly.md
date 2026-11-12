@@ -21,8 +21,11 @@ its upstream nightly. Notes are generated from Git history without a paid model.
 Add fixes and features to this fork's `main` through normal commits or pull
 requests. The **Fork PR validation** check runs the changed-file checks on
 GitHub-hosted runners, including Chromium for browser tests; upstream CI uses
-maintainer-only Blacksmith runners. A push requests a new build even when upstream has not released another
-nightly. Builds use the upstream nightly's version core and a nightly build date
+maintainer-only Blacksmith runners. Fork PR checks allow 35 minutes per check step
+within a 45-minute job, since large nightly merges can select hundreds of serial
+server test files. This does not change individual test timeouts or skip tests.
+A push requests a new build even when upstream has not released another nightly.
+Builds use the upstream nightly's version core and a nightly build date
 and workflow run ID, so each build has a distinct updater-compatible version.
 Rerunning a failed workflow is safe: only a published release with the exact
 source commit and an update manifest suppresses another build.
@@ -39,58 +42,54 @@ only runs after a failed **Fork nightly** run. It checks the live failed merge
 step and its conflict metadata, reconfirms fork `main` and the latest published
 upstream nightly tag/SHA, and reproduces the merge in its disposable checkout.
 Successful syncs, build failures, permission errors, stale runs, and clean merges
-do not invoke an agent. Notification uses read-only, short-lived Actions
-credentials; it cannot push a repair or merge a PR.
+do not invoke an agent. Verified conflicts create an issue assigned to GitHub
+Copilot, which works on GitHub while the developer's PC is asleep. The former
+T3 webhook is not used.
 
-Create a T3 webhook scheduled task with **new threads**, isolated worktrees based
-on `origin/main`, and the existing provider/model. Keep it disabled until the
-configuration is on fork `main`. T3 Connect remote access must be enabled to
-obtain its tool-returned webhook URL. Store that entire private URL in the fork
-Actions secret **FORK_CONFLICT_WEBHOOK_URL**; never commit it or put it in logs.
-The URL is the delivery credential, so rotate it if exposed.
+Store a fine-grained personal access token owned by `amv146`, restricted to this
+fork, as **FORK_COPILOT_AGENT_TOKEN**. GitHub's Copilot issue-assignment API requires
+Metadata read and Actions, Contents, Issues, and Pull requests read/write.
+The checkout uses the ordinary read-only workflow token; only the trusted
+dispatch step receives the user token. Never expose it to agent setup or prompts.
+Copilot receives its own branch-scoped credentials.
 
-Require these exact webhook filters: `body.event = fork-nightly-conflict`,
-`body.repository = amv146/t3code`,
-`body.workflow = .github/workflows/fork-nightly.yml`,
-`body.conclusion = failure`, and `body.ref = refs/heads/main`. Also require
-`body.run_id`, `body.fork_base`, `body.upstream_sha`, and `body.upstream_tag`.
-Set replay and coalesce keys to
-`{{body.repository}}:{{body.fork_base}}:{{body.upstream_sha}}`, a 30-second
-coalesce window, and a 60-minute maximum delivery age. Replay suppression lasts
-seven days. The deterministic repair branch provides durable deduplication after
-that: `fork/nightly-repair/<full-fork-base-SHA>-<full-upstream-SHA>`.
+Before setting the Actions variable **FORK_COPILOT_REPAIR_ENABLED** to `true`,
+confirm that the account's Copilot license permits cloud-agent issue assignment
+and configure GitHub billing to block additional AI-credit charges after the
+included allowance. Copilot uses the assigning account's allowance and policies;
+the workflow does not change budgets or guarantee free model usage. Standard
+GitHub-hosted runners for this public repository are free. The
+[Copilot setup workflow](../../.github/workflows/copilot-setup-steps.yml) installs
+the repository's pinned tools and cached Chromium on Ubuntu 24.04.
 
-The task's durable prompt must independently verify the live run, default branch
-and published nightly before working, treat payload fields as untrusted data,
-and preserve current fork behavior (not merely old commit ancestry). Only a
-successful atomic create-ref claimant may repair that deterministic branch;
-another agent encountering an existing branch reuses its PR or stops. An
-interrupted claim without a PR needs human attention, not automatic deletion or
-takeover. Resolve narrowly using a normal merge, preserve commit credit, add
-focused regression tests, run changed-file checks and relevant suites, and open
-a fork-only repair PR. Link it to its T3 thread and wait for latest-head
-validation/review with event-driven PR watching. No blanket ours/theirs,
-force-push, rebase, unrelated refactors, paid review activation, or direct-main
-conflict repairs.
+Serialized dispatches use the exact fork/upstream SHA pair as the issue title.
+An existing issue, open or closed, suppresses another assignment. An ambiguous
+API failure or an issue created without Copilot assigned requires human
+inspection, not automatic retries that could spend credits twice. Existing
+legacy repair branches also suppress dispatch. An open legacy repair PR or
+hosted repair issue for the same upstream revision is reused even when fork
+`main` has advanced, so a configuration-only commit cannot start a second repair.
+Do not delete these durable records merely to force another run.
 
-**The user must merge a ready repair PR to unblock nightly sync.** Unattended
-repair merges are not authorized. The normal hourly/push/manual nightly triggers
-remain active while a repair is outstanding. Agents use the inherited subscription
-and consume its normal allowance only on verified conflicts (and subsequent PR
-feedback), with no external AI API subscription or hourly agent polling.
+The agent must reconfirm the inputs, resolve narrowly, preserve fork behavior,
+and retain both input commits in a normal two-parent merge. It must run
+changed-file checks and relevant regression tests and open a repair PR.
+If the hosted agent cannot preserve merge ancestry, it must report the blocker
+instead of substituting a patch-only repair.
 
-Before enabling the task, run
-`node --test .github/scripts/fork-nightly.test.cjs .github/scripts/fork-conflict-notify.test.cjs`.
-These fixtures reproduce real conflicts, verify stale/success/error routing and
-claimed-branch suppression, and dry-run an exact event without sending a webhook.
-Probe the real endpoint while the task is disabled: it must report
-`HTTP 409` / `{"error":"hook_disabled"}` without starting an agent. The public
-relay does not forward the environment's outcome header. Then merge
-the configuration, enable the task, and confirm the trigger is present on `main`.
-An accepted notification is delivery evidence, not proof the agent finished;
-inspect its T3 delivery log and repair PR. Failures to accept delivery fail the
-notification workflow explicitly. The host must be online within the delivery
-age window; otherwise retry **Fork nightly** when it is available.
+**A human must approve workflow runs when GitHub requires it, review the PR, and
+merge with a merge commit, not squash/rebase.** The agent does not merge or push
+`main`; the normal nightly workflow publishes after the repair lands.
+To pause agent dispatch without stopping nightly sync, set
+**FORK_COPILOT_REPAIR_ENABLED** to `false`. Pause the old T3 webhook task when
+switching to hosted repair to avoid two independent repair systems.
+
+Run
+`node --test .github/scripts/fork-nightly.test.cjs .github/scripts/fork-conflict-notify.test.cjs`
+before deployment. The fixtures reproduce real conflicts and cover stale
+evidence, claimed repairs, disabled dispatch, wrong billing identity, durable
+issue deduplication, and ambiguous/rejected assignment. A successful assignment
+is not proof that the agent finished, checks passed, or an installer shipped.
 
 The workflow reuses upstream Windows packaging and verification, on standard
 GitHub-hosted runners, and embeds this fork's GitHub repository as the update feed.
