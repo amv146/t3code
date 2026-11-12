@@ -975,24 +975,31 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
-  it.effect("remote status returns null when an unborn repository disappears during lookup", () =>
-    Effect.gen(function* () {
-      const repoDir = yield* makeTempDir("t3code-git-manager-unborn-");
-      yield* runGit(repoDir, ["init", "-b", "main"]);
-      const gate = {
-        matches: (args: ReadonlyArray<string>) =>
-          args[0] === "rev-parse" && args[1] === "--symbolic-full-name" && args[2] === "HEAD",
-        reached: yield* Deferred.make<void>(),
-        release: yield* Deferred.make<void>(),
-      };
-      const { manager } = yield* makeManager({ gitSpawnGate: gate });
-      const inFlight = yield* manager.remoteStatus({ cwd: repoDir }).pipe(Effect.forkChild);
-      yield* Deferred.await(gate.reached);
-      yield* removePath(NodePath.join(repoDir, ".git"));
-      yield* Deferred.succeed(gate.release, undefined);
+  it.effect.each(["missing", "an invalid gitfile"] as const)(
+    "remote status returns null when unborn repository metadata becomes %s during lookup",
+    (metadata) =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-unborn-");
+        yield* runGit(repoDir, ["init", "-b", "main"]);
+        const gate = {
+          matches: (args: ReadonlyArray<string>) =>
+            args[0] === "rev-parse" && args[1] === "--symbolic-full-name" && args[2] === "HEAD",
+          reached: yield* Deferred.make<void>(),
+          release: yield* Deferred.make<void>(),
+        };
+        const { manager } = yield* makeManager({ gitSpawnGate: gate });
+        const inFlight = yield* manager.remoteStatus({ cwd: repoDir }).pipe(Effect.forkChild);
+        yield* Deferred.await(gate.reached);
+        const gitPath = NodePath.join(repoDir, ".git");
+        yield* removePath(gitPath);
+        if (metadata === "an invalid gitfile") {
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.writeFileString(gitPath, "gitdir: missing-git-directory\n");
+        }
+        yield* Deferred.succeed(gate.release, undefined);
 
-      expect(yield* Fiber.join(inFlight)).toBeNull();
-    }),
+        expect(yield* Fiber.join(inFlight)).toBeNull();
+      }),
   );
 
   it.effect("a git read in flight during a T3 git action does not outlive it", () =>
@@ -4531,6 +4538,48 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
             call.baseRefName === "statemachine" && call.headSelector === "octocat:statemachine",
         ),
       ).toBe(false);
+    }),
+  );
+
+  it.effect("creates a fork PR from origin into the upstream remote the provider targets", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const forkDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", forkDir]);
+      yield* runGit(repoDir, [
+        "remote",
+        "add",
+        "upstream",
+        "git@github.com:pingdotgg/codething-mvp.git",
+      ]);
+      yield* runGit(repoDir, ["config", "remote.upstream.gh-resolved", "base"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/fork-only"]);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "fork-only.txt"), "fork only\n");
+      yield* runGit(repoDir, ["add", "fork-only.txt"]);
+      yield* runGit(repoDir, ["commit", "-m", "Fork-only commit"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/fork-only"]);
+      yield* configureVisibleRemoteUrlWithLocalRewrite(
+        repoDir,
+        "origin",
+        "git@github.com:octocat/codething-mvp.git",
+        forkDir,
+      );
+
+      const { service, calls } = createFakeSourceControlProvider({ prListSequence: [[], []] });
+      const { manager } = yield* makeManager({
+        sourceControlProvider: {
+          ...service,
+          createsChangeRequestsIn: ({ repository }) =>
+            Effect.succeed(repository === "pingdotgg/codething-mvp"),
+        },
+      });
+      const result = yield* runStackedAction(manager, { cwd: repoDir, action: "create_pr" });
+
+      expect(result.pr.status).toBe("created");
+      expect(created(calls)).toEqual([
+        { baseRefName: "main", headSelector: "octocat:feature/fork-only" },
+      ]);
     }),
   );
 

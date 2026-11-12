@@ -21,8 +21,11 @@ its upstream nightly. Notes are generated from Git history without a paid model.
 Add fixes and features to this fork's `main` through normal commits or pull
 requests. The **Fork PR validation** check runs the changed-file checks on
 GitHub-hosted runners, including Chromium for browser tests; upstream CI uses
-maintainer-only Blacksmith runners. A push requests a new build even when upstream has not released another
-nightly. Builds use the upstream nightly's version core and a nightly build date
+maintainer-only Blacksmith runners. Fork PR checks allow 35 minutes per check step
+within a 45-minute job, since large nightly merges can select hundreds of serial
+server test files. This does not change individual test timeouts or skip tests.
+A push requests a new build even when upstream has not released another nightly.
+Builds use the upstream nightly's version core and a nightly build date
 and workflow run ID, so each build has a distinct updater-compatible version.
 Rerunning a failed workflow is safe: only a published release with the exact
 source commit and an update manifest suppresses another build.
