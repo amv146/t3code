@@ -63,8 +63,10 @@ Serialized dispatches use the exact fork/upstream SHA pair as the issue title.
 An existing issue, open or closed, suppresses another assignment. An ambiguous
 API failure or an issue created without Copilot assigned requires human
 inspection, not automatic retries that could spend credits twice. Existing
-legacy repair branches also suppress dispatch. Do not delete these durable
-records merely to force another run.
+legacy repair branches also suppress dispatch. An open legacy repair PR or
+hosted repair issue for the same upstream revision is reused even when fork
+`main` has advanced, so a configuration-only commit cannot start a second repair.
+Do not delete these durable records merely to force another run.
 
 The agent must reconfirm the inputs, resolve narrowly, preserve fork behavior,
 and retain both input commits in a normal two-parent merge. It must run

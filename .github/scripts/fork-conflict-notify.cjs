@@ -174,6 +174,23 @@ async function notifyForkConflict({ github, context, core, git, enabled = false,
       "Hosted repair must authenticate as amv146 to use the intended Copilot account.",
     );
   }
+  const pulls = await github.paginate(github.rest.pulls.list, {
+    ...repo,
+    state: "open",
+    base: "main",
+    per_page: 100,
+  });
+  const pending = pulls.find(
+    (pull) =>
+      /^fork\/nightly-repair\/[a-f0-9]{40}-[a-f0-9]{40}$/.test(pull.head.ref) &&
+      pull.head.ref.endsWith(`-${result.payload.upstream_sha}`),
+  );
+  if (pending) {
+    const reason = `Existing upstream repair PR: ${pending.html_url}. Reuse it even though fork main advanced; do not start a second repair for the same upstream revision.`;
+    core.info(reason);
+    await core.summary.addRaw(reason).write();
+    return { ...result, reason, pullRequestUrl: pending.html_url };
+  }
   const key = `${result.payload.fork_base}-${result.payload.upstream_sha}`;
   const title = `Nightly repair: ${key}`;
   const issues = await github.paginate(github.rest.issues.listForRepo, {
@@ -185,7 +202,10 @@ async function notifyForkConflict({ github, context, core, git, enabled = false,
   const existing = issues.filter(
     (issue) =>
       !issue.pull_request &&
-      (issue.title === title || issue.body?.split("\n").includes(`Repair key: ${key}`)),
+      (issue.title === title ||
+        issue.body?.split("\n").includes(`Repair key: ${key}`) ||
+        (issue.state === "open" &&
+          issue.body?.split("\n").includes(`Upstream commit: ${result.payload.upstream_sha}`))),
   );
   if (existing.length > 0) {
     const reason = `Repair issue already exists: ${existing[0].html_url}. Inspect its assignment and PR; no second agent will be started, even if the issue was closed or the first dispatch was interrupted.`;

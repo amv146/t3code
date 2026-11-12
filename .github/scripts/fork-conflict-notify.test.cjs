@@ -97,6 +97,7 @@ function fixture(t, conflict = true) {
     assignmentAccepted: true,
     createError: null,
     copilotAvailable: true,
+    pulls: [],
   };
   const github = {
     async paginate(method, params) {
@@ -134,6 +135,11 @@ function fixture(t, conflict = true) {
           state.issues.push(issue);
           if (state.createError) throw state.createError;
           return { data: issue };
+        },
+      },
+      pulls: {
+        async list() {
+          return { data: state.pulls };
         },
       },
       actions: {
@@ -263,6 +269,15 @@ test("hosted repair assigns one exact conflict to Copilot and never retries an e
   await assert.rejects(notifyForkConflict({ ...f, core }), /not available/);
   assert.equal(f.state.issues.length, 0);
   f.state.copilotAvailable = true;
+  f.state.pulls.push({
+    head: {
+      ref: `fork/nightly-repair/${"c".repeat(40)}-${f.metadata.upstream_sha}`,
+    },
+    html_url: "https://github.com/amv146/t3code/pull/42",
+  });
+  assert.match((await notifyForkConflict({ ...f, core })).reason, /Existing upstream repair PR/);
+  assert.equal(f.state.issues.length, 0);
+  f.state.pulls.length = 0;
 
   const result = await notifyForkConflict({ ...f, core });
   assert.equal(f.state.issues.length, 1);
@@ -278,8 +293,12 @@ test("hosted repair assigns one exact conflict to Copilot and never retries an e
   assert.equal(issue.agent_assignment.base_branch, "main");
   assert.deepEqual(issue.assignees, [{ login: "copilot-swe-agent[bot]" }]);
   assert.match((await notifyForkConflict({ ...f, core })).reason, /already exists/);
-  issue.state = "closed";
+  const originalBody = issue.body;
   issue.title = "Renamed after triage";
+  issue.body = issue.body.replace(/Repair key: .+/, "");
+  assert.match((await notifyForkConflict({ ...f, core })).reason, /already exists/);
+  issue.body = originalBody;
+  issue.state = "closed";
   issue.assignees = [];
   assert.match((await notifyForkConflict({ ...f, core })).reason, /already exists/);
   assert.equal(f.state.issues.length, 1);
