@@ -92,9 +92,50 @@ function fixture(t, conflict = true) {
       published_at: "2026-11-08T05:00:00Z",
     },
     claimed: false,
+    issues: [],
+    login: "amv146",
+    assignmentAccepted: true,
+    createError: null,
+    copilotAvailable: true,
   };
   const github = {
+    async paginate(method, params) {
+      return (await method(params)).data;
+    },
+    async graphql() {
+      return {
+        repository: {
+          suggestedActors: {
+            nodes: state.copilotAvailable
+              ? [{ login: "copilot-swe-agent", __typename: "Bot", id: "copilot-bot-id" }]
+              : [],
+          },
+        },
+      };
+    },
     rest: {
+      users: {
+        async getAuthenticated() {
+          return { data: { login: state.login } };
+        },
+      },
+      issues: {
+        async listForRepo() {
+          return { data: state.issues };
+        },
+        async create(input) {
+          const issue = {
+            ...input,
+            number: state.issues.length + 1,
+            html_url: `https://github.com/amv146/t3code/issues/${state.issues.length + 1}`,
+            state: "open",
+            assignees: state.assignmentAccepted ? [{ login: "copilot-swe-agent[bot]" }] : [],
+          };
+          state.issues.push(issue);
+          if (state.createError) throw state.createError;
+          return { data: issue };
+        },
+      },
       actions: {
         async getWorkflowRun() {
           return { data: state.run };
@@ -131,7 +172,7 @@ function fixture(t, conflict = true) {
       workflow_run: { id: 123, run_attempt: 1 },
     },
   };
-  return { github, context, git, state, metadata, fork };
+  return { github, context, git, state, metadata, fork, enabled: true };
 }
 
 test("conflict markers and persistent repair keys reject ambiguity and executable input", () => {
@@ -159,10 +200,8 @@ test("only the exact failed nightly conflict routes a bounded event, and dry-run
     ...f,
     core,
     dryRun: true,
-    async fetchImpl() {
-      assert.fail("dry-run must not invoke T3");
-    },
   });
+  assert.equal(f.state.issues.length, 0);
   assert.deepEqual(result.payload, {
     event: "fork-nightly-conflict",
     repository: "amv146/t3code",
@@ -192,11 +231,9 @@ test("only the exact failed nightly conflict routes a bounded event, and dry-run
     const skipped = await notifyForkConflict({
       ...f,
       core,
-      async fetchImpl() {
-        assert.fail(`must not invoke T3 for ${name}=${value}`);
-      },
     });
     assert.ok(skipped.reason);
+    assert.equal(f.state.issues.length, 0);
     target[name] = old;
   }
   const original = f.context.repo.owner;
@@ -214,92 +251,51 @@ test("a clean merge or changed tag SHA does not deliver and the probe restores t
   assert.match((await probeForkConflict(f)).reason, /no longer matches/);
 });
 
-test("delivery requires the private relay endpoint and a real accepted outcome, without leaking tokens", async (t) => {
+test("hosted repair assigns one exact conflict to Copilot and never retries an existing issue", async (t) => {
   const f = fixture(t);
-  const endpoint = "https://relay.t3.codes/v1/hooks/test/private-fixture-token";
-  let deliveries = 0;
-  for (const url of [
-    undefined,
-    "http://localhost:9224/hook",
-    "https://example.com/hook",
-    `${endpoint}?q=1`,
-  ]) {
-    await assert.rejects(
-      notifyForkConflict({
-        ...f,
-        core,
-        webhookUrl: url,
-        async fetchImpl() {
-          assert.fail("invalid endpoint must not receive metadata");
-        },
-      }),
-      /webhook endpoint/,
-    );
-  }
-  for (const outcome of [
-    "accepted",
-    "duplicate",
-    "coalesced",
-    null,
-    "filtered",
-    "prompt_too_long",
-  ]) {
-    const delivery = notifyForkConflict({
-      ...f,
-      core,
-      webhookUrl: endpoint,
-      async fetchImpl(url, options) {
-        deliveries++;
-        assert.equal(String(url), endpoint);
-        assert.equal(options.redirect, "error");
-        assert.equal(JSON.parse(options.body).fork_base, f.metadata.fork_base);
-        return new Response('{"deliveryId":"fixture-delivery"}', {
-          status: 202,
-          headers: outcome === null ? {} : { "x-t3-hook-outcome": outcome },
-        });
-      },
-    });
-    if (["filtered", "prompt_too_long"].includes(outcome)) {
-      await assert.rejects(delivery, /did not accept/);
-    } else {
-      await delivery;
-    }
-  }
-  assert.equal(deliveries, 6);
-  await notifyForkConflict({
-    ...f,
-    core,
-    webhookUrl: endpoint,
-    async fetchImpl() {
-      return new Response('{"queued":true}', { status: 202 });
-    },
-  });
-  for (const [status, body] of [
-    [409, '{"error":"hook_disabled"}'],
-    [202, "{}"],
-  ]) {
-    await assert.rejects(
-      notifyForkConflict({
-        ...f,
-        core,
-        webhookUrl: endpoint,
-        async fetchImpl() {
-          return new Response(body, { status });
-        },
-      }),
-      /did not accept|no conflict delivery receipt/,
-    );
-  }
-  await assert.rejects(
-    notifyForkConflict({
-      ...f,
-      core,
-      webhookUrl: endpoint,
-      async fetchImpl() {
-        throw new Error(endpoint);
-      },
-    }),
-    (error) =>
-      !error.message.includes("private-fixture-token") && /delivery failed/.test(error.message),
-  );
+  await notifyForkConflict({ ...f, core, enabled: false });
+  assert.equal(f.state.issues.length, 0);
+  f.state.login = "another-account";
+  await assert.rejects(notifyForkConflict({ ...f, core }), /amv146/);
+  assert.equal(f.state.issues.length, 0);
+  f.state.login = "amv146";
+  f.state.copilotAvailable = false;
+  await assert.rejects(notifyForkConflict({ ...f, core }), /not available/);
+  assert.equal(f.state.issues.length, 0);
+  f.state.copilotAvailable = true;
+
+  const result = await notifyForkConflict({ ...f, core });
+  assert.equal(f.state.issues.length, 1);
+  const issue = f.state.issues[0];
+  assert.equal(result.issueUrl, issue.html_url);
+  assert.match(issue.title, new RegExp(`${f.metadata.fork_base}-${f.metadata.upstream_sha}`));
+  assert.match(issue.body, /two-parent merge/);
+  assert.match(issue.body, /Do not squash/);
+  assert.match(issue.body, /human must review and merge/);
+  assert.match(issue.body, /vp run check:changed/);
+  assert.match(issue.body, new RegExp(f.metadata.upstream_sha));
+  assert.equal(issue.agent_assignment.target_repo, "amv146/t3code");
+  assert.equal(issue.agent_assignment.base_branch, "main");
+  assert.deepEqual(issue.assignees, [{ login: "copilot-swe-agent[bot]" }]);
+  assert.match((await notifyForkConflict({ ...f, core })).reason, /already exists/);
+  issue.state = "closed";
+  issue.title = "Renamed after triage";
+  issue.assignees = [];
+  assert.match((await notifyForkConflict({ ...f, core })).reason, /already exists/);
+  assert.equal(f.state.issues.length, 1);
+});
+
+test("ambiguous creation and rejected assignment fail explicitly without dispatching a second agent", async (t) => {
+  const f = fixture(t);
+  f.state.createError = new Error("Connection interrupted");
+  await assert.rejects(notifyForkConflict({ ...f, core }), /Connection interrupted/);
+  assert.equal(f.state.issues.length, 1);
+  assert.match((await notifyForkConflict({ ...f, core })).reason, /already exists/);
+  assert.equal(f.state.issues.length, 1);
+
+  const rejected = fixture(t);
+  rejected.state.assignmentAccepted = false;
+  await assert.rejects(notifyForkConflict({ ...rejected, core }), /did not assign Copilot/);
+  assert.match((await notifyForkConflict({ ...rejected, core })).reason, /already exists/);
+  assert.equal(rejected.state.issues.length, 1);
 });

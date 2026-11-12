@@ -30,14 +30,19 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Verify conflict routing
         run: node --test .github/scripts/fork-nightly.test.cjs .github/scripts/fork-conflict-notify.test.cjs
-      - name: Verify and notify a nightly conflict
+      - name: Verify and assign a nightly conflict to Copilot
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
-          FORK_CONFLICT_WEBHOOK_URL: ${{ secrets.FORK_CONFLICT_WEBHOOK_URL }}
+          REPAIR_ENABLED: ${{ vars.FORK_COPILOT_REPAIR_ENABLED }}
+          HAS_AGENT_TOKEN: ${{ secrets.FORK_COPILOT_AGENT_TOKEN != '' }}
         with:
+          github-token: ${{ secrets.FORK_COPILOT_AGENT_TOKEN || github.token }}
           script: |
+            const enabled = process.env.REPAIR_ENABLED === 'true';
+            if (enabled && process.env.HAS_AGENT_TOKEN !== 'true') {
+              throw new Error('Set FORK_COPILOT_AGENT_TOKEN before enabling hosted repair.');
+            }
             const { notifyForkConflict } = require('./.github/scripts/fork-conflict-notify.cjs');
             await notifyForkConflict({
-              github, context, core,
-              webhookUrl: process.env.FORK_CONFLICT_WEBHOOK_URL,
+              github, context, core, enabled,
             });
