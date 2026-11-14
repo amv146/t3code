@@ -3,43 +3,33 @@ import { structuredPatch } from "diff";
 
 import type { AzureDevOpsChangeEntry, AzureDevOpsDiffBlock } from "./azureDevOpsPullRequestJson.ts";
 
-/**
- * Pin the iteration to prevent pushes from renumbering files during pagination. The two sources
- * list files in different orders, so a position only holds for the source that wrote it.
- */
+/** Pin the iteration to prevent pushes from renumbering files during pagination. */
 export interface AzureDevOpsDiffCursor {
   readonly iterationId: number;
   readonly fileIndex: number;
-  readonly source: "changes" | "filesdiff";
 }
 
 const CURSOR_SEPARATOR = ":";
 
 const CURSOR_COMPONENT = /^\d+$/;
 
-const FILES_DIFF_MARKER = "d";
-
 export function formatAzureDevOpsDiffCursor(cursor: AzureDevOpsDiffCursor): string {
-  const position = `${cursor.iterationId}${CURSOR_SEPARATOR}${cursor.fileIndex}`;
-  return cursor.source === "filesdiff"
-    ? `${position}${CURSOR_SEPARATOR}${FILES_DIFF_MARKER}`
-    : position;
+  return `${cursor.iterationId}${CURSOR_SEPARATOR}${cursor.fileIndex}`;
 }
 
 export function parseAzureDevOpsDiffCursor(
   raw: string | null | undefined,
 ): AzureDevOpsDiffCursor | null {
   if (raw === null || raw === undefined) return null;
-  const [iteration, file, marker, ...rest] = raw.split(CURSOR_SEPARATOR);
+  const [iteration, file, ...rest] = raw.split(CURSOR_SEPARATOR);
   if (rest.length > 0) return null;
-  if (marker !== undefined && marker !== FILES_DIFF_MARKER) return null;
   if (iteration === undefined || file === undefined) return null;
   if (!CURSOR_COMPONENT.test(iteration) || !CURSOR_COMPONENT.test(file)) return null;
   const iterationId = Number(iteration);
   const fileIndex = Number(file);
   if (!Number.isSafeInteger(iterationId) || iterationId <= 0) return null;
   if (!Number.isSafeInteger(fileIndex) || fileIndex < 0) return null;
-  return { iterationId, fileIndex, source: marker === undefined ? "changes" : "filesdiff" };
+  return { iterationId, fileIndex };
 }
 
 export interface AzureDevOpsFileTexts {

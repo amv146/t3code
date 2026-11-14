@@ -1,12 +1,11 @@
 import { resolvePullRequestAuthorFilter, SourceControlProviderKind } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Result from "effect/Result";
 import * as Semaphore from "effect/Semaphore";
+import { rollupCheckStatuses } from "@t3tools/source-control-core/server/pullRequestChecks";
 import type { PullRequestCapabilities, PullRequestViewerPermissions } from "@t3tools/contracts";
 
 import * as AzureDevOpsPullRequestCli from "./AzureDevOpsPullRequestCli.ts";
 import {
-  azureDevOpsFileDiffPatch,
   azureDevOpsFilePatch,
   azureDevOpsUnreadableFilePatch,
   formatAzureDevOpsDiffCursor,
@@ -16,7 +15,6 @@ import {
   MAX_DIFF_SLICE_FILES,
   byteLength,
   MAX_FILE_DIFF_EDITS,
-  type AzureDevOpsDiffCursor,
   type AzureDevOpsFileTexts,
 } from "./azureDevOpsDiff.ts";
 import {
@@ -30,9 +28,7 @@ import {
   type PullRequestProviderApi,
 } from "@t3tools/source-control-core/server/PullRequestProvider";
 import {
-  toPullRequestChecks,
   type AzureDevOpsChangeEntry,
-  type AzureDevOpsFileDiff,
   type AzureDevOpsItemContent,
   type AzureDevOpsIteration,
   type AzureDevOpsPullRequest,
@@ -40,39 +36,49 @@ import {
 } from "./azureDevOpsPullRequestJson.ts";
 import { definition } from "../shared/definition.ts";
 
-/** Each file pays for two Python startups. */
+/** A file the blob batch missed pays for two Python startups. */
 const DIFF_FILE_CONCURRENCY = 4;
 
 /** Readers share a spawn budget across requests. */
 export const MAX_DIFF_SPAWNS = 2 * DIFF_FILE_CONCURRENCY;
 
-/** Files asked of the files diff per call; one call is one `az` startup. */
-export const FILES_DIFF_PAGE_SIZE = 50;
-
 export const LOCATION_CACHE_CAPACITY = 128;
 
-/** A page of the files diff and where in its list it began. */
-interface FilesDiffPage {
-  readonly cwd: string;
-  readonly number: number;
-  readonly iteration: AzureDevOpsIteration;
-  readonly start: number;
-  readonly files: ReadonlyArray<AzureDevOpsFileDiff>;
+/** A version's change list can run to thousands of paths. */
+const CHANGES_CACHE_CAPACITY = 32;
+
+/**
+ * Files whose contents one `az` run fetches. The run costs about the same for 10 blobs as for
+ * 100, and a slice rarely spends this many before its budgets close it.
+ */
+export const BLOB_BATCH_FILES = 100;
+
+/** Least recently used goes first. */
+function remember<V>(cache: Map<string, V>, capacity: number, key: string, value: V): V {
+  cache.delete(key);
+  if (cache.size >= capacity) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+  return value;
 }
 
-/** What a diff request reads: nothing to go on, or the files from its cursor's position on. */
-type OpenedDiff =
-  | { readonly _tag: "closed"; readonly slice: ProviderDiffSlice }
-  | {
-      readonly _tag: "open";
-      readonly source: AzureDevOpsDiffCursor["source"];
-      readonly iteration: AzureDevOpsIteration;
-      /** A file without blocks has to be read to be diffed. */
-      readonly files: ReadonlyArray<AzureDevOpsFileDiff>;
-      /** The files diff comes a page at a time; the iteration changes come whole. */
-      readonly hasMore: boolean;
-      readonly truncated: boolean;
-    };
+function recall<V>(cache: Map<string, V>, key: string): V | undefined {
+  const held = cache.get(key);
+  if (held !== undefined) remember(cache, Number.POSITIVE_INFINITY, key, held);
+  return held;
+}
+
+/** The blobs a file's two sides need, as the change list names them. */
+function blobIdsOf(change: AzureDevOpsChangeEntry): ReadonlyArray<string> {
+  const ids: string[] = [];
+  if (change.changeKind !== "new" && change.originalObjectId !== null) {
+    ids.push(change.originalObjectId);
+  }
+  if (change.changeKind !== "deleted" && change.objectId !== null) ids.push(change.objectId);
+  return ids;
+}
 
 const CAPABILITIES: PullRequestCapabilities = {
   diff: true,
@@ -168,6 +174,8 @@ export const make = Effect.gen(function* () {
   const diffSpawns = yield* Semaphore.make(MAX_DIFF_SPAWNS);
   const readItemContent = (input: Parameters<typeof cli.readItemContent>[0]) =>
     diffSpawns.withPermits(1)(cli.readItemContent(input));
+  const readBlobs = (input: Parameters<typeof cli.readBlobs>[0]) =>
+    diffSpawns.withPermits(1)(cli.readBlobs(input));
 
   const fail =
     (operation: string) => (error: AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCliError) =>
@@ -178,31 +186,6 @@ export const make = Effect.gen(function* () {
         detail: error.detail,
         cause: error,
       });
-
-  /**
-   * The statuses posted on a pull request. They only name and link what its policies already
-   * report, so a failed read leaves the policy checks as they are rather than losing them.
-   */
-  const listStatuses = Effect.fn("AzureDevOpsPullRequestProvider.listStatuses")(function (input: {
-    readonly cwd: string;
-    readonly location: AzureDevOpsRepositoryLocation | null;
-    readonly number: number;
-  }) {
-    return input.location === null
-      ? Effect.succeed([])
-      : cli
-          .listPullRequestStatuses({
-            cwd: input.cwd,
-            location: input.location,
-            number: input.number,
-          })
-          .pipe(
-            Effect.tapError(() =>
-              Effect.logWarning("Azure DevOps pull request statuses could not be read"),
-            ),
-            Effect.orElseSucceed(() => []),
-          );
-  });
 
   const unsupported = (operation: string) =>
     Effect.fail(
@@ -218,6 +201,9 @@ export const make = Effect.gen(function* () {
 
   // PR locations are immutable; every pull request read records one so later reads can skip it.
   const locations = new Map<string, AzureDevOpsRepositoryLocation>();
+  // A pushed iteration never changes, so neither do its commits nor its change list.
+  const knownIterations = new Map<string, ReadonlyArray<AzureDevOpsIteration>>();
+  const iterationChanges = new Map<string, AzureDevOpsPullRequestCli.AzureDevOpsIterationChanges>();
 
   const readPullRequest = Effect.fn("AzureDevOpsPullRequestProvider.readPullRequest")(
     function* (input: { readonly cwd: string; readonly number: number }) {
@@ -237,28 +223,59 @@ export const make = Effect.gen(function* () {
 
   const locationOf = (input: { readonly cwd: string; readonly number: number }) => {
     const key = `${input.cwd} ${input.number}`;
-    const held = locations.get(key);
-    if (held !== undefined) {
-      locations.delete(key);
-      locations.set(key, held);
-      return Effect.succeed(held);
-    }
+    const held = recall(locations, key);
+    if (held !== undefined) return Effect.succeed(held);
     return readPullRequest(input).pipe(Effect.map((pullRequest) => pullRequest.location));
   };
 
+  const readChecks = (input: { readonly cwd: string }, pullRequest: AzureDevOpsPullRequest) =>
+    cli.listPolicyChecks({
+      cwd: input.cwd,
+      number: pullRequest.number,
+      isDraft: pullRequest.isDraft,
+    });
+
+  /** A later slice names its iteration, which the list it was cut from already holds. */
   const diffScope = Effect.fn("AzureDevOpsPullRequestProvider.diffScope")(function* (input: {
     readonly cwd: string;
     readonly number: number;
+    readonly iterationId?: number;
   }) {
     const location = yield* locationOf(input);
     if (location === null) return null;
+    const key = `${input.cwd} ${input.number}`;
+    const held = recall(knownIterations, key);
+    if (
+      input.iterationId !== undefined &&
+      held?.some((iteration) => iteration.id === input.iterationId)
+    ) {
+      return { location, iterations: held };
+    }
     const iterations = yield* cli.listIterations({
       cwd: input.cwd,
       location,
       number: input.number,
     });
+    remember(knownIterations, LOCATION_CACHE_CAPACITY, key, iterations);
     return { location, iterations };
   });
+
+  const changesOf = (input: {
+    readonly cwd: string;
+    readonly location: AzureDevOpsRepositoryLocation;
+    readonly number: number;
+    readonly iterationId: number;
+  }) => {
+    const key = `${input.cwd} ${input.number} ${input.iterationId}`;
+    const held = recall(iterationChanges, key);
+    return held !== undefined
+      ? Effect.succeed(held)
+      : cli
+          .listIterationChanges(input)
+          .pipe(
+            Effect.map((listed) => remember(iterationChanges, CHANGES_CACHE_CAPACITY, key, listed)),
+          );
+  };
 
   const EMPTY_ITEM: AzureDevOpsItemContent = { contents: "", isBinary: false };
 
@@ -298,37 +315,7 @@ export const make = Effect.gen(function* () {
       })),
     );
 
-  /** A file's patch from Azure's blocks when they stand for it, otherwise from reading the file. */
-  const patchFile = Effect.fn("AzureDevOpsPullRequestProvider.patchFile")(function* (input: {
-    readonly cwd: string;
-    readonly location: AzureDevOpsRepositoryLocation;
-    readonly iteration: AzureDevOpsIteration;
-    readonly file: AzureDevOpsFileDiff;
-  }) {
-    const { change, blocks } = input.file;
-    // Synchronous diffs need yields to let other server work run.
-    yield* Effect.yieldNow;
-    const fromBlocks = blocks === null ? null : azureDevOpsFileDiffPatch({ change, blocks });
-    if (fromBlocks !== null) return fromBlocks;
-    const texts = yield* readTexts({
-      cwd: input.cwd,
-      location: input.location,
-      iteration: input.iteration,
-      change,
-    }).pipe(
-      // Auth, rate-limit and CLI failures must reach the caller.
-      Effect.catchTags({
-        AzureDevOpsPullRequestNotFoundError: () => Effect.succeed(null),
-        AzureDevOpsCommandFailedError: () => Effect.succeed(null),
-        AzureDevOpsPullRequestReadError: () => Effect.succeed(null),
-      }),
-    );
-    return texts === null
-      ? azureDevOpsUnreadableFilePatch(change)
-      : azureDevOpsFilePatch({ change, texts });
-  });
-
-  const listLatestChanges = (input: {
+    const listLatestChanges = (input: {
     readonly cwd: string;
     readonly location: AzureDevOpsRepositoryLocation;
     readonly number: number;
@@ -340,122 +327,13 @@ export const make = Effect.gen(function* () {
           changes: [],
           truncated: false,
         } as AzureDevOpsPullRequestCli.AzureDevOpsIterationChanges)
-      : cli.listIterationChanges({
+      : changesOf({
           cwd: input.cwd,
           location: input.location,
           number: input.number,
           iterationId: latest.id,
         });
   };
-
-  /** The last page the files diff gave, kept until the next one replaces it. */
-  let heldPage: FilesDiffPage | undefined;
-
-  /**
-   * Where a diff walk reads from. It begins on the files diff, one `az` call for a page of files
-   * and their blocks, and reads each file instead when Azure cannot give one. A cursor names the
-   * source it was written for, because the two list files in different orders.
-   */
-  const openDiff = Effect.fn("AzureDevOpsPullRequestProvider.openDiff")(function* (input: {
-    readonly cwd: string;
-    readonly location: AzureDevOpsRepositoryLocation;
-    readonly number: number;
-    readonly cursor: AzureDevOpsDiffCursor | null;
-  }): Effect.fn.Return<OpenedDiff, AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCliError> {
-    const { cursor, ...scope } = input;
-    const start = cursor?.fileIndex ?? 0;
-    // Azure orders each page by itself, so a file index only means something in the page it was
-    // counted in, and a walk always asks for pages from a multiple of the page size.
-    const pageStart = start - (start % FILES_DIFF_PAGE_SIZE);
-
-    const openChanges = (iteration: AzureDevOpsIteration) =>
-      cli.listIterationChanges({ ...scope, iterationId: iteration.id }).pipe(
-        Effect.map((listed): OpenedDiff => ({
-          _tag: "open",
-          source: "changes",
-          iteration,
-          files: listed.changes.slice(start).map((change) => ({ change, blocks: null })),
-          hasMore: false,
-          truncated: listed.truncated,
-        })),
-      );
-
-    const openPage = (page: FilesDiffPage): OpenedDiff => ({
-      _tag: "open",
-      source: "filesdiff",
-      iteration: page.iteration,
-      files: page.files.slice(start - page.start),
-      hasMore: page.files.length === FILES_DIFF_PAGE_SIZE,
-      truncated: false,
-    });
-
-    // A walk that began on the iteration changes carries on there.
-    if (cursor?.source === "changes") {
-      const iteration = (yield* cli.listIterations(scope)).find(
-        (candidate) => candidate.id === cursor.iterationId,
-      );
-      return iteration === undefined
-        ? { _tag: "closed", slice: EMPTY_DIFF_SLICE }
-        : yield* openChanges(iteration);
-    }
-
-    const held = heldPage;
-    if (
-      cursor !== null &&
-      held !== undefined &&
-      held.cwd === scope.cwd &&
-      held.number === scope.number &&
-      held.iteration.id === cursor.iterationId &&
-      held.start <= start &&
-      start < held.start + held.files.length
-    ) {
-      return openPage(held);
-    }
-
-    // The latest iteration pins the walk, so it is read alongside the page. A push between the
-    // two reads can still mix iterations in one page, which nothing later catches.
-    const [iterations, listed] = yield* Effect.all(
-      [
-        cli.listIterations(scope),
-        cli
-          .listFilesDiff({ ...scope, top: FILES_DIFF_PAGE_SIZE, skip: pageStart })
-          .pipe(Effect.result),
-      ],
-      { concurrency: 2 },
-    );
-    const iteration = iterations.at(-1);
-    if (iteration === undefined) return { _tag: "closed", slice: EMPTY_DIFF_SLICE };
-    if (cursor !== null && iteration.id !== cursor.iterationId) {
-      // A push since the walk began; the files diff now lists another change.
-      return { _tag: "closed", slice: { ...EMPTY_DIFF_SLICE, truncated: true } };
-    }
-    if (Result.isFailure(listed)) {
-      if (cursor === null) return yield* openChanges(iteration);
-      // A walk under way has no other order to carry on in. A page that cannot be read, being
-      // too large, will not read on a retry, so it is skipped rather than ending the walk.
-      if (listed.failure._tag !== "AzureDevOpsPullRequestReadError") return yield* listed.failure;
-      return {
-        _tag: "closed",
-        slice: {
-          patch: "",
-          truncated: true,
-          nextCursor: formatAzureDevOpsDiffCursor({
-            iterationId: iteration.id,
-            fileIndex: pageStart + FILES_DIFF_PAGE_SIZE,
-            source: "filesdiff",
-          }),
-        },
-      };
-    }
-    // An empty first page cannot be told from one Azure failed to fill.
-    if (cursor === null && listed.success.length === 0) return yield* openChanges(iteration);
-    // A page that has shrunk under a walk part-way through it has lost the walk's place.
-    if (start > pageStart && listed.success.length <= start - pageStart) {
-      return { _tag: "closed", slice: { ...EMPTY_DIFF_SLICE, truncated: true } };
-    }
-    heldPage = { ...scope, iteration, start: pageStart, files: listed.success };
-    return openPage(heldPage);
-  });
 
   const provider: PullRequestProviderApi = {
     kind: SourceControlProviderKind.make("azure-devops"),
@@ -507,33 +385,29 @@ export const make = Effect.gen(function* () {
         })),
       ),
 
-    getChangeRequestSummary: (input) =>
-      readPullRequest(input).pipe(
-        Effect.mapError(fail("getChangeRequestSummary")),
-        Effect.map(toSummary),
-      ),
-
     getChangeRequestChecks: Effect.fn("AzureDevOpsPullRequestProvider.getChangeRequestChecks")(
       function* (input) {
-        // Policies need only the number, so they read while the pull request is still loading.
-        const [{ pullRequest, statuses }, evaluations] = yield* Effect.all(
-          [
-            readPullRequest(input).pipe(
-              Effect.flatMap((pullRequest) =>
-                listStatuses({
-                  cwd: input.cwd,
-                  location: pullRequest.location,
-                  number: input.number,
-                }).pipe(Effect.map((statuses) => ({ pullRequest, statuses }))),
-              ),
-            ),
-            cli.listPolicyEvaluations({ cwd: input.cwd, number: input.number }),
-          ],
-          { concurrency: "unbounded" },
-        );
-        return { state: pullRequest.state, checks: toPullRequestChecks(evaluations, statuses) };
+        const pullRequest = yield* readPullRequest(input);
+        const checks = yield* readChecks(input, pullRequest);
+        return { state: pullRequest.state, checks };
       },
       Effect.mapError(fail("getChangeRequestChecks")),
+    ),
+
+    getChangeRequestSummary: Effect.fn("AzureDevOpsPullRequestProvider.getChangeRequestSummary")(
+      function* (input) {
+        const pullRequest = yield* readPullRequest(input);
+        // Undefined keeps the last known state; null would claim no checks exist.
+        const checksState = yield* readChecks(input, pullRequest).pipe(
+          Effect.map((checks) => rollupCheckStatuses(checks.map((check) => check.status))),
+          Effect.orElseSucceed(() => undefined),
+        );
+        return {
+          ...toSummary(pullRequest),
+          ...(checksState === undefined ? {} : { checksState }),
+        };
+      },
+      Effect.mapError(fail("getChangeRequestSummary")),
     ),
 
     getChangeRequest: Effect.fn("AzureDevOpsPullRequestProvider.getChangeRequest")(
@@ -560,24 +434,13 @@ export const make = Effect.gen(function* () {
                 Effect.map((listed) => listed.changes.length),
                 Effect.orElseSucceed(() => 0),
               );
-        // Checks are refreshed on their own path too, so a failed read here shows none for now
-        // rather than losing the detail.
-        const readChecks = Effect.all(
+        const [changedFiles, checks] = yield* Effect.all(
           [
-            cli.listPolicyEvaluations({ cwd: input.cwd, number: input.number }),
-            listStatuses({ cwd: input.cwd, location, number: input.number }),
+            countChangedFiles,
+            readChecks(input, pullRequest).pipe(Effect.orElseSucceed(() => [])),
           ],
           { concurrency: "unbounded" },
-        ).pipe(
-          Effect.map(([evaluations, statuses]) => toPullRequestChecks(evaluations, statuses)),
-          Effect.tapError(() =>
-            Effect.logWarning("Azure DevOps pull request checks could not be read"),
-          ),
-          Effect.orElseSucceed(() => []),
         );
-        const [changedFiles, checks] = yield* Effect.all([countChangedFiles, readChecks], {
-          concurrency: "unbounded",
-        });
         const detail: ProviderChangeRequestDetail = {
           ...toChangeRequest(pullRequest),
           body: pullRequest.body,
@@ -633,25 +496,31 @@ export const make = Effect.gen(function* () {
     // the Code tab has nothing to scope itself to and always asks for the whole change.
     getDiff: Effect.fn("AzureDevOpsPullRequestProvider.getDiff")(
       function* (input) {
-        const location = yield* locationOf(input);
-        if (location === null) return EMPTY_DIFF_SLICE;
         const cursor = parseAzureDevOpsDiffCursor(input.cursor);
-
-        const opened = yield* openDiff({
+        const scope = yield* diffScope({
           cwd: input.cwd,
-          location,
           number: input.number,
-          cursor,
+          ...(cursor === null ? {} : { iterationId: cursor.iterationId }),
         });
-        if (opened._tag === "closed") return opened.slice;
-        const { iteration, source, files } = opened;
+        if (scope === null) return EMPTY_DIFF_SLICE;
+        const iteration =
+          cursor === null
+            ? scope.iterations.at(-1)
+            : scope.iterations.find((candidate) => candidate.id === cursor.iterationId);
+        if (iteration === undefined) return EMPTY_DIFF_SLICE;
+        const listed = yield* changesOf({
+          cwd: input.cwd,
+          location: scope.location,
+          number: input.number,
+          iterationId: iteration.id,
+        });
+        const changes = listed.changes;
 
         const sections: string[] = [];
-        let truncated = opened.truncated;
+        let truncated = listed.truncated;
         let bytes = 0;
         let edits = 0;
-        // Files of this request patched so far; the rest wait for the next slice.
-        let patched = 0;
+        let index = cursor?.fileIndex ?? 0;
         let full = false;
         // Prefetched files beyond the slice must be read again.
         const batchWidth = () => {
@@ -668,19 +537,69 @@ export const make = Effect.gen(function* () {
             ),
           );
         };
-        while (!full && patched < files.length) {
-          const batch = files.slice(patched, patched + batchWidth());
-          const patches = yield* Effect.forEach(
+        let blobs: ReadonlyMap<string, AzureDevOpsItemContent> = new Map();
+        let blobsUntil = index;
+        const fromBlobs = (change: AzureDevOpsChangeEntry): AzureDevOpsFileTexts | null => {
+          const side = (id: string | null) =>
+            id === null ? undefined : blobs.get(id.toLowerCase());
+          const oldItem = change.changeKind === "new" ? EMPTY_ITEM : side(change.originalObjectId);
+          const newItem = change.changeKind === "deleted" ? EMPTY_ITEM : side(change.objectId);
+          return oldItem === undefined || newItem === undefined
+            ? null
+            : {
+                oldContents: oldItem.contents,
+                newContents: newItem.contents,
+                binary: oldItem.isBinary || newItem.isBinary,
+              };
+        };
+        while (!full && index < changes.length) {
+          if (index >= blobsUntil) {
+            blobsUntil = index + BLOB_BATCH_FILES;
+            blobs = yield* readBlobs({
+              cwd: input.cwd,
+              location: scope.location,
+              objectIds: changes.slice(index, blobsUntil).flatMap(blobIdsOf),
+            }).pipe(
+              // Per-file reads then answer, or fail, for each file.
+              Effect.catchTags({
+                AzureDevOpsPullRequestNotFoundError: () => Effect.succeed(new Map()),
+                AzureDevOpsCommandFailedError: () => Effect.succeed(new Map()),
+                AzureDevOpsPullRequestReadError: () => Effect.succeed(new Map()),
+              }),
+            );
+          }
+          const batch = changes.slice(index, Math.min(index + batchWidth(), blobsUntil));
+          const read = yield* Effect.forEach(
             batch,
-            (file) => patchFile({ cwd: input.cwd, location, iteration, file }),
+            (change) =>
+              Effect.suspend(() => {
+                const held = fromBlobs(change);
+                return held === null
+                  ? readTexts({ cwd: input.cwd, location: scope.location, iteration, change })
+                  : Effect.succeed(held);
+              }).pipe(
+                // Auth, rate-limit and CLI failures must reach the caller.
+                Effect.catchTags({
+                  AzureDevOpsPullRequestNotFoundError: () => Effect.succeed(null),
+                  AzureDevOpsCommandFailedError: () => Effect.succeed(null),
+                  AzureDevOpsPullRequestReadError: () => Effect.succeed(null),
+                }),
+                Effect.map((texts) => ({ change, texts })),
+              ),
             { concurrency: DIFF_FILE_CONCURRENCY },
           );
-          for (const file of patches) {
+          for (const { change, texts } of read) {
+            // Synchronous diffs need yields to let other server work run.
+            yield* Effect.yieldNow;
+            const file =
+              texts === null
+                ? azureDevOpsUnreadableFilePatch(change)
+                : azureDevOpsFilePatch({ change, texts });
             sections.push(file.section);
             bytes += byteLength(file.section);
             edits += file.edits;
             truncated = truncated || file.truncated;
-            patched += 1;
+            index += 1;
             // Add a file before checking budgets so oversized files cannot stall the cursor.
             if (
               bytes >= MAX_DIFF_SLICE_BYTES ||
@@ -698,13 +617,9 @@ export const make = Effect.gen(function* () {
           patch: sections.join(""),
           truncated,
           nextCursor:
-            patched >= files.length && !opened.hasMore
+            index >= changes.length
               ? null
-              : formatAzureDevOpsDiffCursor({
-                  iterationId: iteration.id,
-                  fileIndex: (cursor?.fileIndex ?? 0) + patched,
-                  source,
-                }),
+              : formatAzureDevOpsDiffCursor({ iterationId: iteration.id, fileIndex: index }),
         };
         return slice;
       },

@@ -2,17 +2,13 @@ import * as Result from "effect/Result";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  decodeFilesDiffJson,
   decodeItemContentJson,
   decodeIterationChangesJson,
   decodeIterationsJson,
-  decodePolicyEvaluationsJson,
-  decodePullRequestStatusesJson,
+  decodePolicyChecksJson,
   decodePullRequestJson,
   decodePullRequestListJson,
   decodeThreadsJson,
-  toPullRequestChecks,
-  type AzureDevOpsPullRequestStatus,
 } from "./azureDevOpsPullRequestJson.ts";
 
 const REST_URL =
@@ -436,113 +432,6 @@ describe("decodeItemContentJson", () => {
   });
 });
 
-/** A page's JSON as a string, in ASCII: what `az` prints for `--query to_string(@)`. */
-const asQuotedPage = (page: unknown) =>
-  JSON.stringify(JSON.stringify(page)).replace(
-    /[\u0080-\uffff]/g,
-    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
-
-describe("decodeFilesDiffJson", () => {
-  const editBlock = {
-    changeType: "edit",
-    originalLineNumberStart: 2,
-    originalLinesCount: 1,
-    originalLines: ["two"],
-    modifiedLineNumberStart: 2,
-    modifiedLinesCount: 1,
-    modifiedLines: ["two again — §6"],
-  };
-
-  it("reads each file with its blocks, naming a deleted file by the path it had", () => {
-    const files = expectSuccess(
-      decodeFilesDiffJson(
-        asQuotedPage({
-          fileDiffs: [
-            {
-              path: "/docs/new.md",
-              originalPath: "/docs/old.md",
-              changeType: "edit, rename",
-              lineDiffBlocks: [editBlock],
-            },
-            { path: null, originalPath: "/gone.md", changeType: "delete" },
-          ],
-        }),
-      ),
-    );
-
-    expect(files).toEqual([
-      {
-        change: {
-          path: "docs/new.md",
-          oldPath: "docs/old.md",
-          changeKind: "rename-changed",
-          objectId: null,
-          originalObjectId: null,
-        },
-        blocks: [
-          {
-            kind: "edit",
-            oldStart: 2,
-            oldCount: 1,
-            newStart: 2,
-            newCount: 1,
-            oldLines: ["two"],
-            newLines: ["two again — §6"],
-          },
-        ],
-      },
-      {
-        change: {
-          path: "gone.md",
-          oldPath: "gone.md",
-          changeKind: "deleted",
-          objectId: null,
-          originalObjectId: null,
-        },
-        blocks: [],
-      },
-    ]);
-  });
-
-  it("keeps a file whose blocks it cannot trust, so the caller can read it another way", () => {
-    const files = expectSuccess(
-      decodeFilesDiffJson(
-        asQuotedPage({
-          fileDiffs: [
-            {
-              path: "/a.md",
-              originalPath: "/a.md",
-              changeType: "edit",
-              lineDiffBlocks: [{ ...editBlock, changeType: "move" }],
-            },
-            {
-              path: "/b.md",
-              originalPath: "/b.md",
-              changeType: "edit",
-              lineDiffBlocks: [{ ...editBlock, modifiedLinesCount: undefined }],
-            },
-          ],
-        }),
-      ),
-    );
-
-    expect(files.map((file) => file.blocks)).toEqual([null, null]);
-  });
-
-  it.each([
-    ["a page without its files", asQuotedPage({ pullRequestTitle: "Anything" })],
-    ["a file that names no path", asQuotedPage({ fileDiffs: [{ changeType: "edit" }] })],
-    [
-      "a file that is not one",
-      asQuotedPage({ fileDiffs: [{ path: "/a.md", originalPath: "/a.md" }, "unexpected"] }),
-    ],
-    ["a page that is not quoted", asJson({ fileDiffs: [] })],
-  ])("fails the whole page for %s, rather than shift the files after it", (_name, raw) => {
-    expect(Result.isFailure(decodeFilesDiffJson(raw))).toBe(true);
-  });
-});
-
 describe("what az devops invoke answers with", () => {
   it("reads the envelope the extension adds its own continuation token to", () => {
     expect(
@@ -629,261 +518,135 @@ describe("what az devops invoke answers with", () => {
   });
 });
 
-const POLICY_URL =
-  "https://dev.azure.com/acme/6f9c9b7f-0000-0000-0000-000000000000/_apis/policy/configurations/12";
+describe("decodePolicyChecksJson", () => {
+  const BUILD_TYPE = "0609b952-1397-4640-95ec-e00a01b2c241";
+  const STATUS_TYPE = "cbdc66da-9728-4af8-aada-9a5a32e4a226";
+  const CONFIGURATION_URL =
+    "https://dev.azure.com/acme/6f9c9b7f-0000-0000-0000-000000000000/_apis/policy/configurations/54";
 
-/** Shaped after Azure's `PolicyEvaluationRecord`, trimmed to the fields that are read. */
-function policy(input: {
-  readonly status: string;
-  readonly typeId?: string;
-  readonly typeName?: string;
-  readonly settings?: Record<string, unknown>;
-  readonly context?: Record<string, unknown> | null;
-  readonly configuration?: Record<string, unknown>;
-}): Record<string, unknown> {
-  return {
-    status: input.status,
+  const evaluation = (
+    status: string,
+    context: Record<string, unknown> | null,
+    settings: Record<string, unknown> = { displayName: "PR validation" },
+    configuration: Record<string, unknown> = {},
+  ) => ({
+    status,
+    context,
     configuration: {
+      url: CONFIGURATION_URL,
       isBlocking: true,
-      isEnabled: true,
-      isDeleted: false,
-      url: POLICY_URL,
-      type: {
-        id: input.typeId ?? "0609b952-1397-4640-95ec-e00a01b2c241",
-        displayName: input.typeName ?? "Build",
-      },
-      settings: input.settings ?? {},
-      ...input.configuration,
+      type: { id: BUILD_TYPE, displayName: "Build" },
+      settings,
+      ...configuration,
     },
-    context: input.context ?? null,
-  };
-}
-
-const STATUS_TYPE_ID = "cbdc66da-9728-4af8-aada-9a5a32e4a226";
-const REVIEWERS_TYPE_ID = "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd";
-
-describe("decodePolicyEvaluationsJson", () => {
-  it("skips disabled, deleted and malformed policies", () => {
-    const evaluations = expectSuccess(
-      decodePolicyEvaluationsJson(
-        JSON.stringify([
-          policy({ status: "approved", configuration: { isEnabled: false } }),
-          policy({ status: "approved", configuration: { isDeleted: true } }),
-          { status: "approved" },
-          "not a policy",
-          policy({ status: "approved", settings: { displayName: "Kept" } }),
-        ]),
-      ),
-    );
-
-    expect(evaluations.map((evaluation) => evaluation.configuration.settings?.displayName)).toEqual(
-      ["Kept"],
-    );
   });
 
-  it("treats empty output as no checks and rejects output that is not a list", () => {
-    expect(expectSuccess(decodePolicyEvaluationsJson(""))).toEqual([]);
-    expect(Result.isFailure(decodePolicyEvaluationsJson("{}"))).toBe(true);
-  });
-});
+  const decodeOne = (value: unknown, isDraft = false) =>
+    expectSuccess(decodePolicyChecksJson(asJson([value]), { isDraft })).checks[0];
 
-function checksFor(
-  policies: ReadonlyArray<unknown>,
-  statuses: ReadonlyArray<AzureDevOpsPullRequestStatus> = [],
-) {
-  return toPullRequestChecks(
-    expectSuccess(decodePolicyEvaluationsJson(JSON.stringify(policies))),
-    statuses,
-  );
-}
-
-describe("toPullRequestChecks", () => {
-  it("maps build and status policies to checks and leaves review policies out", () => {
-    const checks = checksFor([
-      policy({
-        status: "approved",
-        settings: { displayName: "CI" },
-        context: { buildId: 101, buildDefinitionName: "web-ci" },
-      }),
-      policy({
-        status: "running",
-        context: { buildId: 102, buildDefinitionName: "web-e2e" },
-        configuration: { isBlocking: false },
-      }),
-      policy({
-        status: "queued",
-        typeId: STATUS_TYPE_ID,
-        typeName: "Status",
-        settings: { statusName: "license-scan" },
-      }),
-      policy({
-        status: "rejected",
-        typeId: REVIEWERS_TYPE_ID,
-        typeName: "Minimum number of reviewers",
-      }),
-    ]);
-
-    expect(checks).toEqual([
-      {
-        name: "CI",
-        status: "success",
-        description: null,
-        url: "https://dev.azure.com/acme/6f9c9b7f-0000-0000-0000-000000000000/_build/results?buildId=101",
-        required: true,
-      },
-      {
-        name: "license-scan",
-        status: "pending",
-        description: null,
-        url: null,
-        required: true,
-      },
-      {
-        name: "web-e2e",
-        status: "pending",
-        description: null,
-        url: "https://dev.azure.com/acme/6f9c9b7f-0000-0000-0000-000000000000/_build/results?buildId=102",
-        required: false,
-      },
-    ]);
+  it.each([
+    ["approved", "success"],
+    ["running", "pending"],
+    ["rejected", "failure"],
+    ["broken", "failure"],
+    ["notApplicable", "skipped"],
+    ["someNewStatus", "pending"],
+  ])("reads a build evaluation %s as %s", (status, expected) => {
+    expect(decodeOne(evaluation(status, { buildId: 21959 }))?.status).toBe(expected);
   });
 
-  it("names a status policy after the status it last saw, as Azure does", () => {
-    const statuses = expectSuccess(
-      decodePullRequestStatusesJson(
-        JSON.stringify({
-          value: [
-            {
-              id: 4,
-              state: "failed",
-              description: "Security review",
-              targetUrl: "https://example.com/security-review",
-              context: { genre: "security", name: "review" },
-            },
-          ],
-        }),
-      ),
-    );
-    const [check] = checksFor(
-      [
-        policy({
-          status: "rejected",
-          typeId: STATUS_TYPE_ID,
-          typeName: "Status",
-          settings: { statusName: "review", defaultDisplayName: "Review" },
-          context: { latestStatusId: 4 },
-        }),
-      ],
-      statuses,
-    );
-
-    expect(check).toEqual({
-      name: "Security review",
-      status: "failure",
+  it("links a build to its results page, in the project the policy belongs to", () => {
+    expect(decodeOne(evaluation("running", { buildId: 21959 }))).toEqual({
+      name: "PR validation",
+      status: "pending",
       description: null,
-      url: "https://example.com/security-review",
+      url: "https://dev.azure.com/acme/6f9c9b7f-0000-0000-0000-000000000000/_build/results?buildId=21959",
       required: true,
     });
   });
 
-  it("reads an expired build as a failure, as Azure counts it", () => {
-    const [check] = checksFor([
-      policy({
-        status: "queued",
-        settings: { displayName: "web-ui" },
-        context: { buildId: 3, isExpired: true },
-      }),
-    ]);
-
-    expect([check?.status, check?.description]).toEqual(["failure", "Expired"]);
+  it("names a build policy without its own name after the pipeline it runs", () => {
+    const check = decodeOne(evaluation("approved", { buildDefinitionName: "PR - Validation" }, {}));
+    expect(check?.name).toBe("PR - Validation");
+    expect(check?.url).toBeNull();
   });
 
-  it("names the comment policy as Azure's Checks list does", () => {
-    const [check] = checksFor([
-      policy({
-        status: "rejected",
-        typeId: "c6a1889d-b943-4856-b76f-9e46bb6b0df2",
-        typeName: "Comment requirements",
-      }),
-    ]);
-
-    expect([check?.name, check?.status]).toEqual(["Comments must be resolved", "failure"]);
-  });
-
-  it("lists the latest of each status no policy waits on as optional", () => {
-    const statuses = expectSuccess(
-      decodePullRequestStatusesJson(
-        JSON.stringify({
-          value: [
-            { id: 1, state: "pending", description: "Nitpicker", context: { name: "nit" } },
-            {
-              id: 2,
-              state: "succeeded",
-              description: "Nitpicker",
-              targetUrl: "?_a=overview",
-              context: { name: "nit" },
-            },
-            { id: 3, state: "notApplicable", description: "Hidden", context: { name: "na" } },
-            { id: 5, state: "succeeded", description: "Policy-owned", context: { name: "own" } },
-          ],
-        }),
-      ),
-    );
-    const checks = checksFor(
-      [
-        policy({
-          status: "approved",
-          typeId: STATUS_TYPE_ID,
-          typeName: "Status",
-          context: { latestStatusId: 5 },
-        }),
-      ],
-      statuses,
-    );
-
-    expect(checks).toEqual([
-      { name: "Policy-owned", status: "success", description: null, url: null, required: true },
-      { name: "Nitpicker", status: "success", description: null, url: null, required: false },
-    ]);
-  });
-
-  it.each([undefined, null, 0, -1, 1.5])(
-    "reads a manual-only build with no valid run (%s) as skipped rather than pending forever",
-    (buildId) => {
-      const checks = checksFor([
-        policy({
-          status: "queued",
-          settings: { displayName: "Awaiting run" },
-          context: { buildId: 0 },
-        }),
-        policy({
-          status: "queued",
-          settings: { manualQueueOnly: true, displayName: "Optional perf" },
-          context: { buildId },
-        }),
-        policy({
-          status: "queued",
-          settings: { manualQueueOnly: true, displayName: "Queued perf" },
-          context: { buildId: 9 },
-        }),
-        policy({ status: "notApplicable", settings: { displayName: "Docs" } }),
-        policy({ status: "broken", settings: { displayName: "Broken" } }),
-      ]);
-
-      expect(
-        checks.map((check) => [check.name, check.status, check.description, check.url]),
-      ).toEqual([
-        ["Awaiting run", "pending", null, null],
-        ["Broken", "failure", null, null],
-        ["Docs", "skipped", null, null],
-        ["Optional perf", "skipped", "Not run", null],
-        [
-          "Queued perf",
-          "pending",
+  it("reads a status policy, which reports an external service's verdict", () => {
+    expect(
+      decodeOne(
+        evaluation(
+          "rejected",
           null,
-          "https://dev.azure.com/acme/6f9c9b7f-0000-0000-0000-000000000000/_build/results?buildId=9",
-        ],
-      ]);
+          { defaultDisplayName: "SonarCloud", statusName: "gate" },
+          {
+            type: { id: STATUS_TYPE, displayName: "Status" },
+          },
+        ),
+      ),
+    ).toMatchObject({ name: "SonarCloud", status: "failure", url: null });
+  });
+
+  // Both arrive as `queued`; a spinner would never stop on either.
+  it.each([
+    {
+      name: "an expired build",
+      value: evaluation("queued", { buildId: 21919, isExpired: true }),
     },
-  );
+    {
+      name: "a build only a person can queue",
+      value: evaluation("queued", null, { displayName: "Nightly", manualQueueOnly: true }),
+    },
+  ])("asks for action on $name", ({ value }) => {
+    const check = decodeOne(value);
+    expect(check?.status).toBe("action-required");
+    expect(check?.description).not.toBeNull();
+  });
+
+  // A watch waits on every check that asks for action, and nobody has to queue an optional one.
+  it.each([
+    { name: "expired", value: evaluation("queued", { buildId: 21919, isExpired: true }) },
+    {
+      name: "manual-only",
+      value: evaluation("queued", null, { displayName: "Nightly", manualQueueOnly: true }),
+    },
+  ])("skips an optional $name build that nobody queued", ({ value }) => {
+    const check = decodeOne({
+      ...value,
+      configuration: { ...value.configuration, isBlocking: false },
+    });
+    expect(check?.status).toBe("skipped");
+    expect(check?.description).not.toBeNull();
+  });
+
+  it("reports nothing for a build Azure holds back on a draft", () => {
+    expect(decodeOne(evaluation("queued", null), true)).toBeUndefined();
+    expect(decodeOne(evaluation("running", { buildId: 21960 }), true)?.status).toBe("pending");
+  });
+
+  it("keeps a build that is really waiting for an agent as running", () => {
+    expect(decodeOne(evaluation("queued", { buildId: 21960, isExpired: false }))?.status).toBe(
+      "pending",
+    );
+    expect(decodeOne(evaluation("queued", null))?.status).toBe("pending");
+  });
+
+  it.each([
+    {
+      name: "a review gate, which waits on people",
+      configuration: { type: { id: "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd" } },
+    },
+    { name: "a disabled policy", configuration: { isEnabled: false } },
+    { name: "a deleted policy", configuration: { isDeleted: true } },
+  ])("leaves out $name but still counts the row for paging", ({ configuration }) => {
+    const row = evaluation("queued", null, {}, configuration);
+    expect(expectSuccess(decodePolicyChecksJson(asJson([row]), { isDraft: false }))).toEqual({
+      checks: [],
+      rawCount: 1,
+    });
+  });
+
+  it("fails the page on a row it cannot read, which could be a required check", () => {
+    const rows = asJson([evaluation("rejected", null), { status: 7 }]);
+    expect(Result.isFailure(decodePolicyChecksJson(rows, { isDraft: false }))).toBe(true);
+  });
 });
