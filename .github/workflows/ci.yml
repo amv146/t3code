@@ -597,7 +597,7 @@ jobs:
     name: Mobile Native Static Analysis
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.mobile_native != 'false' }}
-    runs-on: ${{ github.repository == 'amv146/t3code' && 'macos-26' || 'blacksmith-6vcpu-macos-26' }}
+    runs-on: ${{ github.repository == 'amv146/t3code' && 'macos-26' || 'blacksmith-6vcpu-macos-27' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
