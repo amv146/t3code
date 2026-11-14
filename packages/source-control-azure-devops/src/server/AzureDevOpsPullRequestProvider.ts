@@ -315,7 +315,7 @@ export const make = Effect.gen(function* () {
       })),
     );
 
-    const listLatestChanges = (input: {
+  const listLatestChanges = (input: {
     readonly cwd: string;
     readonly location: AzureDevOpsRepositoryLocation;
     readonly number: number;
@@ -435,10 +435,7 @@ export const make = Effect.gen(function* () {
                 Effect.orElseSucceed(() => 0),
               );
         const [changedFiles, checks] = yield* Effect.all(
-          [
-            countChangedFiles,
-            readChecks(input, pullRequest).pipe(Effect.orElseSucceed(() => [])),
-          ],
+          [countChangedFiles, readChecks(input, pullRequest).pipe(Effect.orElseSucceed(() => []))],
           { concurrency: "unbounded" },
         );
         const detail: ProviderChangeRequestDetail = {

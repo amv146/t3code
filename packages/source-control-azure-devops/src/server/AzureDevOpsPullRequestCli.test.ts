@@ -46,18 +46,6 @@ function outputWithin(maxOutputBytes: number | undefined, response: string) {
 
 const json = (value: Record<string, unknown>) => JSON.stringify(value);
 
-/** The `az` call for a files diff, when the organization does not offer one. */
-const filesDiffRefused = () =>
-  Effect.fail(
-    new AzureDevOpsCli.AzureDevOpsCommandFailedError({
-      operation: "execute",
-      command: "az",
-      cwd: "/w",
-      argumentCount: 1,
-      cause: "the files diff is not offered here",
-    }),
-  );
-
 const pullRequestRow = {
   pullRequestId: 42,
   title: "Add the page",
@@ -711,7 +699,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       mockedExecute
         .mockReturnValueOnce(Effect.succeed(output(json(pullRequestRow))))
         .mockReturnValueOnce(Effect.succeed(output(json(oneIteration))))
-        .mockReturnValueOnce(filesDiffRefused())
         .mockReturnValueOnce(
           Effect.succeed(
             output(
@@ -756,7 +743,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       mockedExecute
         .mockReturnValueOnce(Effect.succeed(output(json(pullRequestRow))))
         .mockReturnValueOnce(Effect.succeed(output(json(oneIteration))))
-        .mockReturnValueOnce(filesDiffRefused())
         .mockReturnValueOnce(
           Effect.succeed(
             output(
@@ -823,7 +809,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
             ),
           ),
         )
-        .mockReturnValueOnce(filesDiffRefused())
         .mockReturnValueOnce(
           Effect.succeed(
             output(
@@ -849,7 +834,7 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
         number: 42,
       });
 
-      expect(argsOfCall(4)).toContain("includeContentMetadata=true");
+      expect(argsOfCall(3)).toContain("includeContentMetadata=true");
       expect(slice.patch).toContain("Binary files a/logo.png and b/logo.png differ");
       assert.isTrue(slice.truncated);
     }),
@@ -1084,7 +1069,6 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       assert.strictEqual(error._tag, "AzureDevOpsPullRequestIncompleteError");
     }),
   );
-
 
   it.effect("refuses a reviewer az would read as a flag, before running anything", () =>
     Effect.gen(function* () {
