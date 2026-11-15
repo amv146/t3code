@@ -29,12 +29,12 @@ import {
   type ProviderDiffSlice,
   type PullRequestProviderApi,
 } from "@t3tools/source-control-core/server/PullRequestProvider";
-import {
-  type AzureDevOpsChangeEntry,
-  type AzureDevOpsItemContent,
-  type AzureDevOpsIteration,
-  type AzureDevOpsPullRequest,
-  type AzureDevOpsRepositoryLocation,
+import type {
+  AzureDevOpsChangeEntry,
+  AzureDevOpsItemContent,
+  AzureDevOpsIteration,
+  AzureDevOpsPullRequest,
+  AzureDevOpsRepositoryLocation,
 } from "./azureDevOpsPullRequestJson.ts";
 import { definition } from "../shared/definition.ts";
 
@@ -216,34 +216,32 @@ export const make = Effect.gen(function* () {
     >
   >();
 
-  const readPullRequest = Effect.fn("AzureDevOpsPullRequestProvider.readPullRequest")(
-    (input: { readonly cwd: string; readonly number: number }) =>
-      Effect.suspend(() => {
-        const key = `${input.cwd} ${input.number}`;
-        const pending = Deferred.makeUnsafe<
-          AzureDevOpsRepositoryLocation | null,
-          AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCliError
-        >();
-        pendingLocations.set(key, pending);
-        return cli.getPullRequest({ cwd: input.cwd, number: input.number }).pipe(
-          Effect.map((pullRequest) => {
-            if (pullRequest.location !== null) {
-              remember(locations, LOCATION_CACHE_CAPACITY, key, pullRequest.location);
-            }
-            return pullRequest;
+  const readPullRequest = (input: { readonly cwd: string; readonly number: number }) =>
+    Effect.suspend(() => {
+      const key = `${input.cwd} ${input.number}`;
+      const pending = Deferred.makeUnsafe<
+        AzureDevOpsRepositoryLocation | null,
+        AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCliError
+      >();
+      pendingLocations.set(key, pending);
+      return cli.getPullRequest({ cwd: input.cwd, number: input.number }).pipe(
+        Effect.map((pullRequest) => {
+          if (pullRequest.location !== null) {
+            remember(locations, LOCATION_CACHE_CAPACITY, key, pullRequest.location);
+          }
+          return pullRequest;
+        }),
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            if (pendingLocations.get(key) === pending) pendingLocations.delete(key);
+            Deferred.doneUnsafe(
+              pending,
+              Exit.map(exit, (pullRequest) => pullRequest.location),
+            );
           }),
-          Effect.onExit((exit) =>
-            Effect.sync(() => {
-              if (pendingLocations.get(key) === pending) pendingLocations.delete(key);
-              Deferred.doneUnsafe(
-                pending,
-                Exit.map(exit, (pullRequest) => pullRequest.location),
-              );
-            }),
-          ),
-        );
-      }),
-  );
+        ),
+      );
+    });
 
   const locationOf = (input: { readonly cwd: string; readonly number: number }) =>
     Effect.suspend(() => {
@@ -454,10 +452,10 @@ export const make = Effect.gen(function* () {
                 .pipe(Effect.orElseSucceed(() => []));
         // The trial merge's lastMergeSourceCommit can lag behind a new source push.
         const headSha = iterations.at(-1)?.headCommit;
-        const countChangedFiles =
+        const changedFiles =
           location === null
-            ? Effect.succeed(0)
-            : listLatestChanges({
+            ? 0
+            : yield* listLatestChanges({
                 cwd: input.cwd,
                 location,
                 number: input.number,
@@ -466,10 +464,7 @@ export const make = Effect.gen(function* () {
                 Effect.map((listed) => listed.changes.length),
                 Effect.orElseSucceed(() => 0),
               );
-        const [changedFiles, checks] = yield* Effect.all(
-          [countChangedFiles, readChecks(input, pullRequest).pipe(Effect.orElseSucceed(() => []))],
-          { concurrency: "unbounded" },
-        );
+        const checks = yield* readChecks(input, pullRequest).pipe(Effect.orElseSucceed(() => []));
         const detail: ProviderChangeRequestDetail = {
           ...toChangeRequest(pullRequest),
           body: pullRequest.body,

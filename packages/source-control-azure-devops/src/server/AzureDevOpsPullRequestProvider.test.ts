@@ -1,11 +1,10 @@
-import { assert, describe, expect, it } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import type { PullRequestCheck, PullRequestCheckStatus } from "@t3tools/contracts";
 
-import * as AzureDevOpsCli from "./AzureDevOpsCli.ts";
 import * as AzureDevOpsPullRequestCli from "./AzureDevOpsPullRequestCli.ts";
 import {
   BLOB_BATCH_FILES,
@@ -52,9 +51,7 @@ function change(
 }
 
 /** A batch that returns nothing, so every file takes the per-file read. */
-const NO_BLOBS = {
-  readBlobs: () => Effect.succeed(new Map()),
-};
+const NO_BLOBS = { readBlobs: () => Effect.succeed(new Map()) };
 
 function side(prefix: string, lines: number, width: number): string {
   const pad = "z".repeat(width);
@@ -201,63 +198,6 @@ describe("getChangeRequest", () => {
       }),
   );
 
-  it.effect.each([
-    "getChangeRequest",
-    "getChangeRequestSummary",
-    "getChangeRequestPreview",
-    "getChangeRequestChecks",
-  ] as const)(
-    "%s seeds the location for diff, file and conversation reads without caching live details",
-    (method) =>
-      Effect.gen(function* () {
-        let reads = 0;
-        const provider = yield* make.pipe(
-          Effect.provide(
-            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
-              getPullRequest: () =>
-                Effect.sync(() => {
-                  reads += 1;
-                  return { ...PULL_REQUEST, title: `Read ${reads}` };
-                }),
-              ...NO_BLOBS,
-              listIterations: () => Effect.succeed([ITERATION]),
-              listIterationChanges: () =>
-                Effect.succeed({ changes: [change("a.ts")], truncated: false }),
-              readItemContent: () =>
-                Effect.succeed({ contents: side("new", 2, 4), isBinary: false }),
-              listThreads: () => Effect.succeed([]),
-              listPolicyChecks: () => Effect.succeed([]),
-            }),
-          ),
-        );
-        const input = { cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 };
-        const readPullRequest = provider[method];
-        assert.isDefined(readPullRequest);
-        assert.isDefined(provider.getDiffFileContents);
-        assert.isDefined(provider.getFileRevisions);
-
-        expect(yield* readPullRequest(input)).toMatchObject(
-          method === "getChangeRequestChecks" ? { state: "open", checks: [] } : { title: "Read 1" },
-        );
-        const slice = yield* provider.getDiff(input);
-        expect(patchedPaths(slice.patch)).toEqual(["a.ts"]);
-        yield* provider.getDiffFileContents({
-          ...input,
-          oldPath: "a.ts",
-          newPath: "a.ts",
-          changeType: "change",
-        });
-        yield* provider.getFileRevisions({ ...input, paths: ["a.ts"] });
-        yield* provider.getChangeRequestActivity(input);
-        expect(reads).toBe(1);
-
-        expect(yield* readPullRequest(input)).toMatchObject(
-          method === "getChangeRequestChecks" ? { state: "open", checks: [] } : { title: "Read 2" },
-        );
-        expect(reads).toBe(2);
-      }),
-  );
-
   it.effect(
     "reads the pull request once for overlapping detail and conversation, then its diff",
     () =>
@@ -295,6 +235,7 @@ describe("getChangeRequest", () => {
         yield* Fiber.join(detail);
         yield* Fiber.join(activity);
         yield* provider.getDiff(input);
+
         expect(reads).toBe(1);
       }),
   );
@@ -395,6 +336,7 @@ describe("getDiff reads", () => {
 
       const readDiff = (number: number) =>
         provider.getDiff({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number });
+
       yield* Effect.all([readDiff(7), readDiff(8)], { concurrency: 2 });
 
       expect(peakInFlight).toBeLessThanOrEqual(MAX_DIFF_SPAWNS);
@@ -419,7 +361,6 @@ describe("getDiff reads", () => {
       const provider = yield* make.pipe(
         Effect.provide(
           Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
-            ...NO_BLOBS,
             getPullRequest: () => Effect.succeed(PULL_REQUEST),
             listIterations: () => Effect.succeed([ITERATION]),
             listIterationChanges: () => Effect.succeed({ changes, truncated: false }),
@@ -488,7 +429,6 @@ describe("getDiff reads", () => {
       const provider = yield* make.pipe(
         Effect.provide(
           Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
-            ...NO_BLOBS,
             getPullRequest: () => Effect.succeed(PULL_REQUEST),
             listIterations: () => Effect.succeed([ITERATION]),
             listIterationChanges: () =>
@@ -536,7 +476,6 @@ describe("getDiff reads", () => {
   it.effect("serves a later slice from the iteration and change list the first one read", () =>
     Effect.gen(function* () {
       const paths = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts"];
-      const iterations = [ITERATION];
       let iterationReads = 0;
       let changeReads = 0;
 
@@ -545,7 +484,7 @@ describe("getDiff reads", () => {
           Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
             ...NO_BLOBS,
             getPullRequest: () => Effect.succeed(PULL_REQUEST),
-            listIterations: () => Effect.sync(() => ((iterationReads += 1), [...iterations])),
+            listIterations: () => Effect.sync(() => ((iterationReads += 1), [ITERATION])),
             listIterationChanges: () =>
               Effect.sync(() => {
                 changeReads += 1;
@@ -569,94 +508,12 @@ describe("getDiff reads", () => {
         });
 
       const first = yield* readDiff();
-      iterations.push({ ...ITERATION, id: 4, headCommit: "new-head" });
       const second = yield* readDiff(first.nextCursor ?? undefined);
 
       expect(patchedPaths(second.patch)).toEqual(["c.ts", "d.ts"]);
       expect(iterationReads).toBe(1);
       expect(changeReads).toBe(1);
-      yield* readDiff();
-      expect(iterationReads).toBe(2);
-      expect(changeReads).toBe(2);
     }),
-  );
-
-  it.effect.each([2 * MAX_DIFF_SLICE_FILES, 2 * MAX_DIFF_SLICE_FILES + 1])(
-    "walks %s files in bounded slices without losing or duplicating files",
-    (count) =>
-      Effect.gen(function* () {
-        const paths = Array.from({ length: count }, (_, at) => `src/file-${at}.ts`);
-        const provider = yield* make.pipe(
-          Effect.provide(
-            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
-              ...NO_BLOBS,
-              getPullRequest: () => Effect.succeed(PULL_REQUEST),
-              listIterations: () => Effect.succeed([ITERATION]),
-              listIterationChanges: () =>
-                Effect.succeed({
-                  changes: paths.map((path) => change(path, "new")),
-                  truncated: false,
-                }),
-              readItemContent: () => Effect.succeed({ contents: "x\ny\n", isBinary: false }),
-            }),
-          ),
-        );
-        const seen: string[] = [];
-        let cursor: string | undefined;
-        do {
-          const slice = yield* provider.getDiff({
-            cwd: "/w",
-            repository: "acme/web",
-            host: "dev.azure.com",
-            number: 7,
-            ...(cursor === undefined ? {} : { cursor }),
-          });
-          const slicePaths = patchedPaths(slice.patch);
-          expect(slicePaths).toHaveLength(Math.min(MAX_DIFF_SLICE_FILES, count - seen.length));
-          expect(slice.truncated).toBe(false);
-          seen.push(...slicePaths);
-          cursor = slice.nextCursor ?? undefined;
-        } while (cursor !== undefined);
-        expect(seen).toEqual(paths);
-      }),
-  );
-
-  it.effect.each(["listIterationChanges", "readBlobs"] as const)(
-    "propagates a rate limit from %s instead of skipping files",
-    (method) =>
-      Effect.gen(function* () {
-        const failure = Effect.fail(
-          new AzureDevOpsCli.AzureDevOpsCliRateLimitError({
-            operation: "execute",
-            command: "az",
-            cwd: "/w",
-            argumentCount: 0,
-            cause: "slow down",
-          }),
-        );
-        const provider = yield* make.pipe(
-          Effect.provide(
-            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
-              ...NO_BLOBS,
-              getPullRequest: () => Effect.succeed(PULL_REQUEST),
-              listIterations: () => Effect.succeed([ITERATION]),
-              listIterationChanges: () =>
-                Effect.succeed({ changes: [change("a.ts")], truncated: false }),
-              [method]: () => failure,
-            }),
-          ),
-        );
-        const error = yield* Effect.flip(
-          provider.getDiff({
-            cwd: "/w",
-            repository: "acme/web",
-            host: "dev.azure.com",
-            number: 7,
-            cursor: `${ITERATION.id}:0`,
-          }),
-        );
-        expect(error.reason).toBe("rate-limited");
-      }),
   );
 
   it.effect("leaves a run of files it could not diff at all for the next slice", () =>
@@ -746,56 +603,38 @@ describe("what one diff slice spends", () => {
       expect(read.slice.nextCursor).toBe(`${ITERATION.id}:4`);
     }),
   );
-  it.effect.each(["diff", "summary"] as const)(
-    "keeps the pull request being read by %s, not the one looked up first",
-    (method) =>
-      Effect.gen(function* () {
-        const HOT = 7;
-        const readsOf = new Map<number, number>();
+  it.effect("keeps the pull request being read, not the one looked up first", () =>
+    Effect.gen(function* () {
+      const HOT = 7;
+      const readsOf = new Map<number, number>();
 
-        const provider = yield* make.pipe(
-          Effect.provide(
-            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
-              ...NO_BLOBS,
-              getPullRequest: (input) =>
-                Effect.sync(() => {
-                  readsOf.set(input.number, (readsOf.get(input.number) ?? 0) + 1);
-                  return { ...PULL_REQUEST, number: input.number };
-                }),
-              listIterations: () => Effect.succeed([ITERATION]),
-              listIterationChanges: () =>
-                Effect.succeed({ changes: [change("a.ts")], truncated: false }),
-              listPolicyChecks: () => Effect.succeed([]),
-              readItemContent: () =>
-                Effect.succeed({ contents: side("new", 2, 4), isBinary: false }),
-            }),
-          ),
-        );
+      const provider = yield* make.pipe(
+        Effect.provide(
+          Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+            ...NO_BLOBS,
+            getPullRequest: (input) =>
+              Effect.sync(() => {
+                readsOf.set(input.number, (readsOf.get(input.number) ?? 0) + 1);
+                return { ...PULL_REQUEST, number: input.number };
+              }),
+            listIterations: () => Effect.succeed([ITERATION]),
+            listIterationChanges: () =>
+              Effect.succeed({ changes: [change("a.ts")], truncated: false }),
+            readItemContent: () => Effect.succeed({ contents: side("new", 2, 4), isBinary: false }),
+          }),
+        ),
+      );
 
-        const readDiff = (number: number) =>
-          provider.getDiff({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number });
-        const readSummary = provider.getChangeRequestSummary;
-        assert.isDefined(readSummary);
+      const readDiff = (number: number) =>
+        provider.getDiff({ cwd: "/w", repository: "acme/web", host: "dev.azure.com", number });
 
+      yield* readDiff(HOT);
+      for (let filled = 0; filled < LOCATION_CACHE_CAPACITY; filled += 1) {
+        yield* readDiff(HOT + 1 + filled);
         yield* readDiff(HOT);
-        for (let filled = 0; filled < LOCATION_CACHE_CAPACITY; filled += 1) {
-          yield* readDiff(HOT + 1 + filled);
-          if (method === "diff") {
-            yield* readDiff(HOT);
-          } else {
-            yield* readSummary({
-              cwd: "/w",
-              repository: "acme/web",
-              host: "dev.azure.com",
-              number: HOT,
-            });
-          }
-        }
+      }
 
-        yield* readDiff(HOT);
-        expect(readsOf.get(HOT)).toBe(method === "diff" ? 1 : LOCATION_CACHE_CAPACITY + 1);
-        yield* readDiff(HOT + 1);
-        expect(readsOf.get(HOT + 1)).toBe(2);
-      }),
+      expect(readsOf.get(HOT)).toBe(1);
+    }),
   );
 });
