@@ -1,5 +1,7 @@
 import { resolvePullRequestAuthorFilter, SourceControlProviderKind } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import { rollupCheckStatuses } from "@t3tools/source-control-core/server/pullRequestChecks";
 import type { PullRequestCapabilities, PullRequestViewerPermissions } from "@t3tools/contracts";
@@ -27,12 +29,12 @@ import {
   type ProviderDiffSlice,
   type PullRequestProviderApi,
 } from "@t3tools/source-control-core/server/PullRequestProvider";
-import {
-  type AzureDevOpsChangeEntry,
-  type AzureDevOpsItemContent,
-  type AzureDevOpsIteration,
-  type AzureDevOpsPullRequest,
-  type AzureDevOpsRepositoryLocation,
+import type {
+  AzureDevOpsChangeEntry,
+  AzureDevOpsItemContent,
+  AzureDevOpsIteration,
+  AzureDevOpsPullRequest,
+  AzureDevOpsRepositoryLocation,
 } from "./azureDevOpsPullRequestJson.ts";
 import { definition } from "../shared/definition.ts";
 
@@ -205,28 +207,56 @@ export const make = Effect.gen(function* () {
   const knownIterations = new Map<string, ReadonlyArray<AzureDevOpsIteration>>();
   const iterationChanges = new Map<string, AzureDevOpsPullRequestCli.AzureDevOpsIterationChanges>();
 
-  const readPullRequest = Effect.fn("AzureDevOpsPullRequestProvider.readPullRequest")(
-    function* (input: { readonly cwd: string; readonly number: number }) {
-      const pullRequest = yield* cli.getPullRequest({ cwd: input.cwd, number: input.number });
-      const location = pullRequest.location;
-      if (location === null) return pullRequest;
-      const key = `${input.cwd} ${input.number}`;
-      locations.delete(key);
-      if (locations.size >= LOCATION_CACHE_CAPACITY) {
-        const oldest = locations.keys().next().value;
-        if (oldest !== undefined) locations.delete(oldest);
-      }
-      locations.set(key, location);
-      return pullRequest;
-    },
-  );
+  // Reads still running, so a location lookup joins one instead of spawning its own az process.
+  const pendingLocations = new Map<
+    string,
+    Deferred.Deferred<
+      AzureDevOpsRepositoryLocation | null,
+      AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCliError
+    >
+  >();
 
-  const locationOf = (input: { readonly cwd: string; readonly number: number }) => {
-    const key = `${input.cwd} ${input.number}`;
-    const held = recall(locations, key);
-    if (held !== undefined) return Effect.succeed(held);
-    return readPullRequest(input).pipe(Effect.map((pullRequest) => pullRequest.location));
-  };
+  const readPullRequest = (input: { readonly cwd: string; readonly number: number }) =>
+    Effect.suspend(() => {
+      const key = `${input.cwd} ${input.number}`;
+      const pending = Deferred.makeUnsafe<
+        AzureDevOpsRepositoryLocation | null,
+        AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCliError
+      >();
+      pendingLocations.set(key, pending);
+      return cli.getPullRequest({ cwd: input.cwd, number: input.number }).pipe(
+        Effect.map((pullRequest) => {
+          if (pullRequest.location !== null) {
+            remember(locations, LOCATION_CACHE_CAPACITY, key, pullRequest.location);
+          }
+          return pullRequest;
+        }),
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            if (pendingLocations.get(key) === pending) pendingLocations.delete(key);
+            Deferred.doneUnsafe(
+              pending,
+              Exit.map(exit, (pullRequest) => pullRequest.location),
+            );
+          }),
+        ),
+      );
+    });
+
+  const locationOf = (input: { readonly cwd: string; readonly number: number }) =>
+    Effect.suspend(() => {
+      const key = `${input.cwd} ${input.number}`;
+      const held = recall(locations, key);
+      if (held !== undefined) return Effect.succeed(held);
+      const ownRead = readPullRequest(input).pipe(
+        Effect.map((pullRequest) => pullRequest.location),
+      );
+      const pending = pendingLocations.get(key);
+      // A read that failed or was interrupted under another request is retried here.
+      return pending === undefined
+        ? ownRead
+        : Deferred.await(pending).pipe(Effect.catchCause(() => ownRead));
+    });
 
   const readChecks = (input: { readonly cwd: string }, pullRequest: AzureDevOpsPullRequest) =>
     cli.listPolicyChecks({
@@ -422,10 +452,10 @@ export const make = Effect.gen(function* () {
                 .pipe(Effect.orElseSucceed(() => []));
         // The trial merge's lastMergeSourceCommit can lag behind a new source push.
         const headSha = iterations.at(-1)?.headCommit;
-        const countChangedFiles =
+        const changedFiles =
           location === null
-            ? Effect.succeed(0)
-            : listLatestChanges({
+            ? 0
+            : yield* listLatestChanges({
                 cwd: input.cwd,
                 location,
                 number: input.number,
@@ -434,10 +464,7 @@ export const make = Effect.gen(function* () {
                 Effect.map((listed) => listed.changes.length),
                 Effect.orElseSucceed(() => 0),
               );
-        const [changedFiles, checks] = yield* Effect.all(
-          [countChangedFiles, readChecks(input, pullRequest).pipe(Effect.orElseSucceed(() => []))],
-          { concurrency: "unbounded" },
-        );
+        const checks = yield* readChecks(input, pullRequest).pipe(Effect.orElseSucceed(() => []));
         const detail: ProviderChangeRequestDetail = {
           ...toChangeRequest(pullRequest),
           body: pullRequest.body,
