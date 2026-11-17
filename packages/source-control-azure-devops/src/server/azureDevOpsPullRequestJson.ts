@@ -13,6 +13,7 @@ import type {
   PullRequestLabel,
   PullRequestMergeMethod,
   PullRequestMergeability,
+  PullRequestReviewDecision,
   PullRequestState,
 } from "@t3tools/contracts";
 import { TrimmedNonEmptyString } from "@t3tools/contracts";
@@ -22,10 +23,22 @@ import { azureDevOpsPullRequestWebUrl } from "./azureDevOpsPullRequests.ts";
 
 // CLI fields vary by command; unknown enum values must not fail the payload.
 const RawIdentitySchema = Schema.Struct({
+  id: Schema.optional(Schema.NullOr(Schema.String)),
   displayName: Schema.optional(Schema.NullOr(Schema.String)),
   uniqueName: Schema.optional(Schema.NullOr(Schema.String)),
   imageUrl: Schema.optional(Schema.NullOr(Schema.String)),
 });
+
+const RawReviewerSchema = Schema.Struct({
+  ...RawIdentitySchema.fields,
+  /** 10 approved, 5 approved with suggestions, 0 none, -5 waiting for author, -10 rejected. */
+  vote: Schema.optional(Schema.NullOr(Schema.Number)),
+  isRequired: Schema.optional(Schema.NullOr(Schema.Boolean)),
+});
+
+const RawThreadPropertySchema = Schema.optional(
+  Schema.NullOr(Schema.Struct({ $value: Schema.optional(Schema.Unknown) })),
+);
 
 const RawLabelSchema = Schema.Struct({ name: Schema.optional(Schema.NullOr(Schema.String)) });
 
@@ -47,7 +60,7 @@ const RawPullRequestSchema = Schema.Struct({
   ),
   mergeStatus: Schema.optional(Schema.NullOr(Schema.String)),
   createdBy: Schema.optional(Schema.NullOr(RawIdentitySchema)),
-  reviewers: Schema.optional(Schema.NullOr(Schema.Array(RawIdentitySchema))),
+  reviewers: Schema.optional(Schema.NullOr(Schema.Array(RawReviewerSchema))),
   /** `az repos pr list` fills this; `az repos pr show` returns null. */
   labels: Schema.optional(Schema.NullOr(Schema.Array(RawLabelSchema))),
   sourceRefName: TrimmedNonEmptyString,
@@ -80,6 +93,18 @@ const RawPullRequestSchema = Schema.Struct({
 const RawThreadSchema = Schema.Struct({
   id: Schema.Int,
   isDeleted: Schema.optional(Schema.NullOr(Schema.Boolean)),
+  properties: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        CodeReviewThreadType: RawThreadPropertySchema,
+        CodeReviewVoteResult: RawThreadPropertySchema,
+        CodeReviewVotedByTfId: RawThreadPropertySchema,
+        CodeReviewVotedByDisplayName: RawThreadPropertySchema,
+        CodeReviewVotedByIdentity: RawThreadPropertySchema,
+      }),
+    ),
+  ),
+  identities: Schema.optional(Schema.NullOr(Schema.Record(Schema.String, Schema.Unknown))),
   threadContext: Schema.optional(
     Schema.NullOr(Schema.Struct({ filePath: Schema.optional(Schema.NullOr(Schema.String)) })),
   ),
@@ -163,6 +188,9 @@ export interface AzureDevOpsPullRequest {
   readonly body: string;
   readonly reviewRequestLogins: ReadonlyArray<string>;
   readonly reviewers: ReadonlyArray<PullRequestActor>;
+  /** Keyed by `identityKey`; vote threads can name the voter only by identity id. */
+  readonly reviewersById: ReadonlyMap<string, PullRequestActor>;
+  readonly reviewDecision: PullRequestReviewDecision | null;
   readonly labels: ReadonlyArray<PullRequestLabel>;
   readonly location: AzureDevOpsRepositoryLocation | null;
   readonly autoMergeEnabled: boolean;
@@ -175,6 +203,11 @@ function toActor(raw: Schema.Schema.Type<typeof RawIdentitySchema> | null | unde
   return login === null
     ? null
     : { login, name: trimmed(raw?.displayName), avatarUrl: trimmed(raw?.imageUrl) };
+}
+
+/** Azure writes identity ids both with and without dashes. */
+function identityKey(id: string | null | undefined): string | null {
+  return trimmed(id)?.replaceAll("-", "").toLowerCase() || null;
 }
 
 function toLabels(
@@ -236,13 +269,107 @@ function toAutoMergeMethod(
   }
 }
 
+function reviewStateForVote(
+  vote: number | null | undefined,
+): "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED" | null {
+  switch (vote) {
+    case 10:
+    case 5:
+      return "APPROVED";
+    case -10:
+    case -5:
+      return "CHANGES_REQUESTED";
+    case 0:
+      return "DISMISSED";
+    default:
+      return null;
+  }
+}
+
+function isPendingReviewer(reviewer: Schema.Schema.Type<typeof RawReviewerSchema>): boolean {
+  const state = reviewStateForVote(reviewer.vote);
+  return state === null || state === "DISMISSED";
+}
+
+function toReviewDecision(
+  allReviewers: ReadonlyArray<Schema.Schema.Type<typeof RawReviewerSchema>>,
+  author: Schema.Schema.Type<typeof RawIdentitySchema> | null | undefined,
+): PullRequestReviewDecision | null {
+  const authorId = identityKey(author?.id);
+  const authorLogin = toActor(author)?.login.toLowerCase();
+  // An author's own vote is not a review, even if Azure lists them among the reviewers.
+  const reviewers = allReviewers.filter(
+    (reviewer) =>
+      !(authorId !== null && identityKey(reviewer.id) === authorId) &&
+      !(authorLogin !== undefined && toActor(reviewer)?.login.toLowerCase() === authorLogin),
+  );
+  if (reviewers.length === 0) return null;
+  const states = reviewers.map((reviewer) => reviewStateForVote(reviewer.vote));
+  if (states.includes("CHANGES_REQUESTED")) return "changes-requested";
+  if (reviewers.some((reviewer) => reviewer.isRequired === true && isPendingReviewer(reviewer))) {
+    return "review-required";
+  }
+  return states.includes("APPROVED") ? "approved" : "review-required";
+}
+
+type RawThreadProperties = NonNullable<Schema.Schema.Type<typeof RawThreadSchema>["properties"]>;
+
+function propertyText(property: RawThreadProperties[keyof RawThreadProperties]): string | null {
+  const value = property?.$value;
+  return typeof value === "string" || typeof value === "number" ? trimmed(String(value)) : null;
+}
+
+function toVoteReviewState(properties: RawThreadProperties | null | undefined) {
+  if (propertyText(properties?.CodeReviewThreadType) !== "VoteUpdate") return null;
+  return reviewStateForVote(Number(propertyText(properties?.CodeReviewVoteResult) ?? NaN));
+}
+
+const decodeIdentity = Schema.decodeUnknownExit(RawIdentitySchema);
+
+function toVoter(
+  thread: Schema.Schema.Type<typeof RawThreadSchema>,
+  reviewersById: ReadonlyMap<string, PullRequestActor>,
+): PullRequestActor | null {
+  const properties = thread.properties;
+  // The voter reference, unlike the initiator, indexes this thread's identity dictionary.
+  const ref = propertyText(properties?.CodeReviewVotedByIdentity);
+  const identity = ref === null ? undefined : decodeIdentity(thread.identities?.[ref]);
+  if (identity !== undefined && Exit.isSuccess(identity)) {
+    const raw = identity.value;
+    const key = identityKey(raw.id);
+    const reviewer = key === null ? undefined : reviewersById.get(key);
+    if (reviewer !== undefined) return reviewer;
+    // Display names are not unique; former reviewers keep a login or stable Azure identity.
+    const login = trimmed(raw.uniqueName) ?? key ?? trimmed(raw.displayName);
+    if (login !== null) {
+      return { login, name: trimmed(raw.displayName), avatarUrl: trimmed(raw.imageUrl) };
+    }
+  }
+  const key = identityKey(propertyText(properties?.CodeReviewVotedByTfId));
+  const reviewer = key === null ? undefined : reviewersById.get(key);
+  if (reviewer !== undefined) return reviewer;
+  const name = propertyText(properties?.CodeReviewVotedByDisplayName);
+  const login = key ?? name;
+  return login === null ? null : { login, name, avatarUrl: null };
+}
+
 function toPullRequest(
   raw: Schema.Schema.Type<typeof RawPullRequestSchema>,
 ): AzureDevOpsPullRequest | null {
   const autoMergeMethod = toAutoMergeMethod(raw);
-  const reviewers = (raw.reviewers ?? []).flatMap((reviewer) => {
+  const rawReviewers = raw.reviewers ?? [];
+  const reviewers: PullRequestActor[] = [];
+  const reviewersById = new Map<string, PullRequestActor>();
+  for (const reviewer of rawReviewers) {
     const actor = toActor(reviewer);
-    return actor === null ? [] : [actor];
+    if (actor === null) continue;
+    reviewers.push(actor);
+    const key = identityKey(reviewer.id);
+    if (key !== null) reviewersById.set(key, actor);
+  }
+  const reviewRequestLogins = rawReviewers.flatMap((reviewer) => {
+    const login = isPendingReviewer(reviewer) ? toActor(reviewer)?.login : undefined;
+    return login === undefined ? [] : [login];
   });
   const closedAt = trimmed(raw.closedDate);
   const url = trimmed(
@@ -272,8 +399,10 @@ function toPullRequest(
     updatedAt: closedAt ?? raw.creationDate,
     closedAt,
     body: raw.description ?? "",
-    reviewRequestLogins: reviewers.map((reviewer) => reviewer.login),
+    reviewRequestLogins,
     reviewers,
+    reviewersById,
+    reviewDecision: toReviewDecision(rawReviewers, raw.createdBy),
     labels: toLabels(raw.labels),
     location: toLocation(raw),
     autoMergeEnabled: (raw.autoCompleteSetBy ?? null) !== null,
@@ -355,6 +484,7 @@ export function decodeLabelsJson(
 
 export function decodeThreadsJson(
   raw: string,
+  reviewersById: ReadonlyMap<string, PullRequestActor> = new Map(),
 ): Result.Result<ReadonlyArray<PullRequestComment>, DecodeFailure> {
   const decoded = decodeThreadPage(raw);
   if (!Result.isSuccess(decoded)) {
@@ -367,25 +497,29 @@ export function decodeThreadsJson(
     const thread = decodedThread.value;
     if (thread.isDeleted === true) continue;
     const path = toRepositoryPath(thread.threadContext?.filePath);
+    const voteReviewState = toVoteReviewState(thread.properties);
+    const voter = voteReviewState === null ? null : toVoter(thread, reviewersById);
     for (const comment of thread.comments ?? []) {
       const publishedDate = trimmed(comment.publishedDate);
+      const isSystem = comment.commentType?.trim().toLowerCase() === "system";
       if (
         comment.isDeleted === true ||
-        comment.commentType?.trim().toLowerCase() === "system" ||
+        (isSystem && voteReviewState === null) ||
         (comment.content ?? "").trim().length === 0 ||
         publishedDate === null
       ) {
         continue;
       }
+      const reviewState = isSystem ? voteReviewState : null;
       comments.push({
         id: `${thread.id}:${comment.id ?? 0}`,
-        kind: path === null ? "issue-comment" : "review-comment",
-        author: toActor(comment.author),
+        kind: reviewState !== null ? "review" : path === null ? "issue-comment" : "review-comment",
+        author: reviewState === null ? toActor(comment.author) : voter,
         body: comment.content ?? "",
         createdAt: publishedDate,
         url: null,
-        path,
-        reviewState: null,
+        path: reviewState === null ? path : null,
+        reviewState,
       });
     }
   }

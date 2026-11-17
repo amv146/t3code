@@ -169,7 +169,13 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       mockedExecute
         .mockReturnValueOnce(
           Effect.succeed(
-            output(json({ ...pullRequestRow, lastMergeSourceCommit: { commitId: previousHead } })),
+            output(
+              json({
+                ...pullRequestRow,
+                lastMergeSourceCommit: { commitId: previousHead },
+                reviewers: [{ uniqueName: "reviewer@acme.dev", vote: 10 }],
+              }),
+            ),
           ),
         )
         .mockReturnValueOnce(
@@ -205,6 +211,7 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       expect(argsOfCall(2)).toContain("iterationId=2");
       expect(argsOfCall(4)).toContain("pullRequestLabels");
       expect(detail.labels).toEqual([{ name: "release-1.0", color: null }]);
+      expect(detail.reviewDecision).toBe("approved");
       expect(mockedExecute).toHaveBeenCalledTimes(5);
     }),
   );
@@ -320,6 +327,7 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
       mockedExecute.mockReturnValueOnce(
         Effect.succeed(output(JSON.stringify({ name: "bilal@acme.dev", type: "user" }))),
       );
+
       const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
 
       const viewer = yield* cli.getViewer({ cwd: "/w" });
@@ -333,6 +341,157 @@ layer("AzureDevOpsPullRequestCli.layer", (it) => {
         "--only-show-errors",
         "--output",
         "json",
+      ]);
+    }),
+  );
+
+  it.effect("pages Reviewing over voted and malformed rows without losing group requests", () =>
+    Effect.gen(function* () {
+      const votes = [10, 0, 0, null, -10, 20, 5, undefined, -5];
+      const rows = pullRequestRows(votes.length, 1).map((row, index) =>
+        index === 1
+          ? { pullRequestId: "malformed" }
+          : {
+              ...row,
+              reviewers:
+                index === 3
+                  ? [{ displayName: "[web]\\Reviewers", uniqueName: "web-reviewers" }]
+                  : [{ uniqueName: "Bilal@acme.dev", vote: votes[index] }],
+            },
+      );
+      mockedExecute.mockImplementation((input) => {
+        const skipIndex = input.args.indexOf("--skip");
+        const skip = skipIndex === -1 ? 0 : Number(input.args[skipIndex + 1]);
+        const top = Number(input.args[input.args.indexOf("--top") + 1]);
+        return Effect.succeed(output(JSON.stringify(rows.slice(skip, skip + top))));
+      });
+      const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+      const input = {
+        cwd: "/w",
+        repository: "web",
+        state: "open" as const,
+        involvement: "reviewing" as const,
+        viewer: "bilal@acme.dev",
+        limit: 2,
+      };
+      const first = yield* cli.listPullRequests(input);
+      const second = yield* cli.listPullRequests({
+        ...input,
+        cursor: { delivered: first.cursorAdvance, updatedBefore: "2026-07-02T00:00:00Z" },
+      });
+      expect(first.items.map((item) => item.number)).toEqual([3, 4]);
+      expect(second.items.map((item) => item.number)).toEqual([6, 8]);
+      expect([first.cursorAdvance, second.cursorAdvance]).toEqual([4, 4]);
+      expect([first.truncated, second.truncated]).toEqual([true, true]);
+      const third = yield* cli.listPullRequests({
+        ...input,
+        cursor: {
+          delivered: first.cursorAdvance + second.cursorAdvance,
+          updatedBefore: "2026-07-02T00:00:00Z",
+        },
+      });
+      expect(third).toEqual({ items: [], truncated: false, cursorAdvance: 1 });
+    }),
+  );
+
+  it.effect.each([true, false])(
+    "bounds Reviewing reads only after a resumable row exists (early row: %s)",
+    (earlyRow) =>
+      Effect.gen(function* () {
+        let reads = 0;
+        mockedExecute.mockImplementation((input) => {
+          reads += 1;
+          const skipIndex = input.args.indexOf("--skip");
+          const skip = skipIndex === -1 ? 0 : Number(input.args[skipIndex + 1]);
+          const top = Number(input.args[input.args.indexOf("--top") + 1]);
+          return Effect.succeed(
+            output(
+              JSON.stringify(
+                pullRequestRows(top, skip + 1).map((row, index) => ({
+                  ...row,
+                  reviewers: [
+                    {
+                      uniqueName: "bilal@acme.dev",
+                      vote: index === 0 && reads === (earlyRow ? 1 : 4) ? 0 : 10,
+                    },
+                  ],
+                })),
+              ),
+            ),
+          );
+        });
+        const cli = yield* AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli;
+        const batch = yield* cli.listPullRequests({
+          cwd: "/w",
+          repository: "web",
+          state: "all",
+          involvement: "reviewing",
+          viewer: "bilal@acme.dev",
+          limit: 2,
+        });
+        expect(reads).toBe(earlyRow ? 3 : 4);
+        expect(batch.items.map((item) => item.number)).toEqual([earlyRow ? 1 : 10]);
+        expect(batch.truncated).toBe(true);
+        expect(batch.cursorAdvance).toBe(earlyRow ? 7 : 12);
+      }),
+  );
+
+  it.effect("carries decisions and dictionary-attributed vote activity through the provider", () =>
+    Effect.gen(function* () {
+      const reviewer = { id: "d6245f20-2af8-44f4-9451-8107cb2767db", uniqueName: "jane@acme.dev" };
+      mockedExecute.mockImplementation((input) =>
+        Effect.succeed(
+          output(
+            input.args.includes("pullRequestThreads")
+              ? json({
+                  value: [
+                    {
+                      id: 2,
+                      properties: {
+                        CodeReviewThreadType: { $value: "VoteUpdate" },
+                        CodeReviewVoteResult: { $value: "10" },
+                        CodeReviewVotedByIdentity: { $value: "1" },
+                      },
+                      identities: { "1": reviewer },
+                      comments: [
+                        {
+                          id: 1,
+                          content: "Vote.",
+                          commentType: "system",
+                          publishedDate: "2026-07-02T00:00:00Z",
+                        },
+                      ],
+                    },
+                  ],
+                })
+              : input.args.includes("policy")
+                ? "[]"
+                : input.args.includes("list")
+                  ? JSON.stringify([{ ...pullRequestRow, reviewers: [{ ...reviewer, vote: 10 }] }])
+                  : json({ ...pullRequestRow, reviewers: [{ ...reviewer, vote: 10 }] }),
+          ),
+        ),
+      );
+      const provider = yield* AzureDevOpsPullRequestProvider.make;
+      const target = { cwd: "/w", repository: "platform/web", host: "dev.azure.com" };
+      const page = yield* provider.listChangeRequests({
+        ...target,
+        state: "open",
+        involvement: "all",
+        viewer: "me@acme.dev",
+        limit: 10,
+      });
+      const summary = yield* provider.getChangeRequestSummary!({ ...target, number: 42 });
+      const activity = yield* provider.getChangeRequestActivity({ ...target, number: 42 });
+      expect(page.items[0]?.reviewDecision).toBe("approved");
+      expect(summary.reviewDecision).toBe("approved");
+      expect(activity.comments).toMatchObject([
+        {
+          id: "2:1",
+          kind: "review",
+          reviewState: "APPROVED",
+          author: { login: "jane@acme.dev" },
+        },
       ]);
     }),
   );
