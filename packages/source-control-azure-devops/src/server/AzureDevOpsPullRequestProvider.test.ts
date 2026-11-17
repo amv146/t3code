@@ -39,6 +39,8 @@ const PULL_REQUEST = {
   body: "",
   reviewRequestLogins: [],
   reviewers: [],
+  reviewersById: new Map(),
+  reviewDecision: null,
   labels: [],
   location: { project: "acme", repository: "web" },
   autoMergeEnabled: false,
@@ -241,6 +243,91 @@ describe("getChangeRequest", () => {
         yield* provider.getDiff(input);
 
         expect(reads).toBe(1);
+      }),
+  );
+
+  it.effect.each(["summary-first", "activity-first"] as const)(
+    "shares overlapping summary and activity reads (%s) without caching the vote",
+    (order) =>
+      Effect.gen(function* () {
+        let reads = 0;
+        const release = yield* Deferred.make<void>();
+        const provider = yield* make.pipe(
+          Effect.provide(
+            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+              getPullRequest: () =>
+                Effect.sync(() => {
+                  reads += 1;
+                }).pipe(Effect.andThen(Deferred.await(release)), Effect.as(PULL_REQUEST)),
+              listPolicyChecks: () => Effect.succeed([]),
+              listThreads: () => Effect.succeed([]),
+            }),
+          ),
+        );
+        const input = { cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 };
+        const first =
+          order === "summary-first"
+            ? provider.getChangeRequestSummary!(input).pipe(Effect.asVoid)
+            : provider.getChangeRequestActivity(input).pipe(Effect.asVoid);
+        const second =
+          order === "summary-first"
+            ? provider.getChangeRequestActivity(input).pipe(Effect.asVoid)
+            : provider.getChangeRequestSummary!(input).pipe(Effect.asVoid);
+        const a = yield* Effect.forkChild(first, { startImmediately: true });
+        const b = yield* Effect.forkChild(second, { startImmediately: true });
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(a);
+        yield* Fiber.join(b);
+        expect(reads).toBe(1);
+        yield* provider.getChangeRequestActivity(input);
+        expect(reads).toBe(2);
+      }),
+  );
+
+  it.effect.each(["failure", "interruption"] as const)(
+    "retries an overlapping owner's %s without losing the activity read",
+    (outcome) =>
+      Effect.gen(function* () {
+        let reads = 0;
+        const release = yield* Deferred.make<void>();
+        const provider = yield* make.pipe(
+          Effect.provide(
+            Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({
+              getPullRequest: () =>
+                Effect.suspend(() => {
+                  reads += 1;
+                  return reads > 1
+                    ? Effect.succeed(PULL_REQUEST)
+                    : Deferred.await(release).pipe(
+                        Effect.andThen(
+                          Effect.fail(
+                            new AzureDevOpsPullRequestCli.AzureDevOpsPullRequestReadError({
+                              command: "az",
+                              cwd: "/w",
+                              operation: "getPullRequest",
+                              cause: "unavailable",
+                            }),
+                          ),
+                        ),
+                      );
+                }),
+              listPolicyChecks: () => Effect.succeed([]),
+              listThreads: () => Effect.succeed([]),
+            }),
+          ),
+        );
+        const input = { cwd: "/w", repository: "acme/web", host: "dev.azure.com", number: 7 };
+        const owner = yield* Effect.forkChild(
+          Effect.exit(provider.getChangeRequestSummary!(input)),
+          { startImmediately: true },
+        );
+        const reader = yield* Effect.forkChild(provider.getChangeRequestActivity(input), {
+          startImmediately: true,
+        });
+        if (outcome === "interruption") yield* Fiber.interrupt(owner);
+        else yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(reader);
+        expect(reads).toBe(2);
       }),
   );
 });

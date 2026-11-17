@@ -40,6 +40,52 @@ function expectSuccess<A>(result: Result.Result<A, unknown>): A {
 
 const asJson = (value: unknown) => JSON.stringify(value);
 
+const JANE_ID = "d6245f20-2af8-44f4-9451-8107cb2767db";
+const BILAL_ID = "8c8c7d32-6b1b-47f4-b2e9-30b477b5ab3d";
+
+function reviewersById() {
+  const detail = expectSuccess(
+    decodePullRequestJson(
+      asJson(
+        pullRequest({
+          reviewers: [
+            { id: JANE_ID, displayName: "Jane Doe", uniqueName: "jane@acme.dev", vote: 10 },
+            { id: BILAL_ID, displayName: "Bilal Hassan", uniqueName: "bilal@acme.dev", vote: -10 },
+          ],
+        }),
+      ),
+    ),
+  );
+  if (detail === null) throw new Error("expected a pull request");
+  return detail.reviewersById;
+}
+
+function voteThread(input: {
+  readonly id: number;
+  readonly vote: string | number | null;
+  readonly voterId: string;
+  readonly voterName: string;
+}) {
+  return {
+    id: input.id,
+    properties: {
+      CodeReviewThreadType: { $value: "VoteUpdate" },
+      ...(input.vote === null ? {} : { CodeReviewVoteResult: { $value: input.vote } }),
+      CodeReviewVotedByTfId: { $value: input.voterId },
+      CodeReviewVotedByDisplayName: { $value: input.voterName },
+    },
+    comments: [
+      {
+        id: 1,
+        content: "Localized vote notification.",
+        commentType: "system",
+        author: { displayName: "Service account", uniqueName: "service@acme.dev" },
+        publishedDate: `2026-07-${String(input.id).padStart(2, "0")}T00:00:00Z`,
+      },
+    ],
+  };
+}
+
 describe("decodePullRequestListJson", () => {
   it("reads a pull request as a change request", () => {
     const batch = expectSuccess(
@@ -47,6 +93,7 @@ describe("decodePullRequestListJson", () => {
         asJson([
           pullRequest({
             labels: [{ id: "4f1c", name: "release-1.0", active: true, url: null }],
+            reviewers: [{ uniqueName: "jane@acme.dev", vote: 10 }],
           }),
         ]),
       ),
@@ -63,6 +110,8 @@ describe("decodePullRequestListJson", () => {
       isDraft: false,
       mergeability: "mergeable",
       labels: [{ name: "release-1.0" }],
+      reviewDecision: "approved",
+      reviewRequestLogins: [],
     });
   });
 
@@ -175,6 +224,83 @@ describe("decodePullRequestJson", () => {
 
     expect(detail).toBeNull();
   });
+
+  it.each([
+    ["approved by a required reviewer", [{ vote: 10, isRequired: true }], [], "approved"],
+    ["rejected", [{ vote: -10 }], [], "changes-requested"],
+    ["not yet voted on", [{ vote: 0, isRequired: true }], ["me@example.com"], "review-required"],
+    [
+      "approved but waiting on a required group",
+      [{ vote: 10 }, { uniqueName: "reviewers", vote: 0, isRequired: true }],
+      ["reviewers"],
+      "review-required",
+    ],
+    [
+      "approved with suggestions, with an optional reviewer still to vote",
+      [{ vote: 5 }, { uniqueName: "jane@example.com", vote: 0 }],
+      ["jane@example.com"],
+      "approved",
+    ],
+    [
+      "sent back to its author despite an approval",
+      [{ vote: -5 }, { uniqueName: "jane@example.com", vote: 10, isRequired: true }],
+      [],
+      "changes-requested",
+    ],
+    ["without reviewers", [], [], null],
+    ["approved only by its author", [{ uniqueName: "BILAL@ACME.DEV", vote: 10 }], [], null],
+    [
+      "rejected only by its author",
+      [{ uniqueName: "BILAL@ACME.DEV", vote: -10 }, { vote: 5 }],
+      [],
+      "approved",
+    ],
+    ["with a new positive vote", [{ vote: 20 }], ["me@example.com"], "review-required"],
+    ["with a new negative vote", [{ vote: -20 }], ["me@example.com"], "review-required"],
+    [
+      "waiting on an unknown required vote despite an approval",
+      [{ vote: 10 }, { uniqueName: "required", vote: 20, isRequired: true }],
+      ["required"],
+      "review-required",
+    ],
+    ["with an absent vote", [{}], ["me@example.com"], "review-required"],
+    ["with a null vote", [{ vote: null }], ["me@example.com"], "review-required"],
+  ])(
+    "reads the reviewers' votes on a pull request %s",
+    (_case, votes, reviewRequestLogins, reviewDecision) => {
+      const detail = expectSuccess(
+        decodePullRequestJson(
+          asJson(
+            pullRequest({
+              reviewers: votes.map((vote) => ({
+                displayName: "Reviewer",
+                uniqueName: "me@example.com",
+                ...vote,
+              })),
+            }),
+          ),
+        ),
+      );
+      expect(detail).toMatchObject({ reviewRequestLogins, reviewDecision });
+    },
+  );
+
+  it("recognizes the author's normalized identity even when their login changed", () => {
+    const detail = expectSuccess(
+      decodePullRequestJson(
+        asJson(
+          pullRequest({
+            createdBy: { id: BILAL_ID, uniqueName: "new@acme.dev" },
+            reviewers: [
+              { id: BILAL_ID.replaceAll("-", "").toUpperCase(), uniqueName: "old", vote: -10 },
+              { id: JANE_ID, uniqueName: "jane@acme.dev", vote: 10 },
+            ],
+          }),
+        ),
+      ),
+    );
+    expect(detail?.reviewDecision).toBe("approved");
+  });
 });
 
 describe("decodeThreadsJson", () => {
@@ -280,6 +406,229 @@ describe("decodeThreadsJson", () => {
 
     expect(comments).toEqual([]);
   });
+
+  it.each([
+    ["10", "APPROVED"],
+    [5, "APPROVED"],
+    ["-10", "CHANGES_REQUESTED"],
+    [-5, "CHANGES_REQUESTED"],
+    ["0", "DISMISSED"],
+    [0, "DISMISSED"],
+  ])("reads legacy vote %s as %s without using the system author", (vote, reviewState) => {
+    const thread = voteThread({
+      id: 2,
+      vote,
+      voterId: JANE_ID.replaceAll("-", "").toUpperCase(),
+      voterName: "Jane Doe",
+    });
+    const comments = expectSuccess(decodeThreadsJson(asJson({ value: [thread] }), reviewersById()));
+    expect(comments).toMatchObject([
+      {
+        id: "2:1",
+        kind: "review",
+        reviewState,
+        author: { login: "jane@acme.dev" },
+        createdAt: "2026-07-02T00:00:00Z",
+        path: null,
+      },
+    ]);
+  });
+
+  it("resolves the voter dictionary before legacy fields, not the initiating identity or author", () => {
+    const thread = voteThread({ id: 2, vote: "10", voterId: BILAL_ID, voterName: "Bilal" });
+    const comments = expectSuccess(
+      decodeThreadsJson(
+        asJson({
+          value: [
+            {
+              ...thread,
+              properties: {
+                ...thread.properties,
+                CodeReviewVotedByIdentity: { $value: "1" },
+                CodeReviewVotedByInitiatorIdentity: { $value: "2" },
+              },
+              identities: {
+                "1": { id: JANE_ID.replaceAll("-", "").toUpperCase(), displayName: "Old name" },
+                "2": { id: BILAL_ID, uniqueName: "initiator@acme.dev" },
+              },
+            },
+            {
+              ...thread,
+              id: 3,
+              properties: {
+                CodeReviewThreadType: { $value: "VoteUpdate" },
+                CodeReviewVoteResult: { $value: "-5" },
+                CodeReviewVotedByIdentity: { $value: 1 },
+              },
+              identities: { "1": { id: JANE_ID, uniqueName: "jane@acme.dev" } },
+              comments: [{ ...thread.comments[0], author: { uniqueName: "jane@acme.dev" } }],
+            },
+          ],
+        }),
+        reviewersById(),
+      ),
+    );
+    expect(comments.map((comment) => [comment.author?.login, comment.reviewState])).toEqual([
+      ["jane@acme.dev", "APPROVED"],
+      ["jane@acme.dev", "CHANGES_REQUESTED"],
+    ]);
+  });
+
+  it.each(["legacy", "dictionary"] as const)(
+    "keeps former voters with the same display name distinct through %s identities",
+    (source) => {
+      const threads = ["0f0f0f0f", "0e0e0e0e"].map((prefix, index) => {
+        const id = `${prefix}-0000-0000-0000-000000000000`;
+        const thread = voteThread({ id: index + 2, vote: 10, voterId: id, voterName: "Sam Lee" });
+        return source === "legacy"
+          ? thread
+          : {
+              ...thread,
+              properties: {
+                CodeReviewThreadType: { $value: "VoteUpdate" },
+                CodeReviewVoteResult: { $value: "10" },
+                CodeReviewVotedByIdentity: { $value: "1" },
+              },
+              identities: { "1": { id, displayName: "Sam Lee" } },
+            };
+      });
+      const comments = expectSuccess(
+        decodeThreadsJson(asJson({ value: threads }), reviewersById()),
+      );
+      expect(comments.map((comment) => comment.author)).toEqual([
+        { login: "0f0f0f0f000000000000000000000000", name: "Sam Lee", avatarUrl: null },
+        { login: "0e0e0e0e000000000000000000000000", name: "Sam Lee", avatarUrl: null },
+      ]);
+    },
+  );
+
+  it("keeps a dictionary voter's login after they leave the reviewer list", () => {
+    const thread = voteThread({ id: 2, vote: "10", voterId: BILAL_ID, voterName: "Bilal" });
+    const comments = expectSuccess(
+      decodeThreadsJson(
+        asJson({
+          value: [
+            {
+              ...thread,
+              properties: {
+                CodeReviewThreadType: { $value: "VoteUpdate" },
+                CodeReviewVoteResult: { $value: "10" },
+                CodeReviewVotedByIdentity: { $value: "1" },
+              },
+              identities: {
+                "1": { id: JANE_ID, displayName: "Jane", uniqueName: "former@acme.dev" },
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    expect(comments[0]?.author?.login).toBe("former@acme.dev");
+  });
+
+  it("falls back to legacy identity fields when the dictionary reference is absent or unusable", () => {
+    const thread = voteThread({ id: 2, vote: "10", voterId: JANE_ID, voterName: "Jane" });
+    const comments = expectSuccess(
+      decodeThreadsJson(
+        asJson({
+          value: [
+            { ...thread, identities: null },
+            {
+              ...thread,
+              id: 3,
+              properties: {
+                ...thread.properties,
+                CodeReviewVotedByIdentity: { $value: "missing" },
+              },
+              identities: {},
+            },
+            {
+              ...thread,
+              id: 4,
+              properties: { ...thread.properties, CodeReviewVotedByIdentity: { $value: "1" } },
+              identities: { "1": {} },
+            },
+            {
+              ...thread,
+              id: 5,
+              properties: {
+                ...thread.properties,
+                CodeReviewVotedByIdentity: { $value: "1" },
+              },
+              identities: { "1": null },
+            },
+          ],
+        }),
+        reviewersById(),
+      ),
+    );
+    expect(comments.map((comment) => comment.author?.login)).toEqual([
+      "jane@acme.dev",
+      "jane@acme.dev",
+      "jane@acme.dev",
+      "jane@acme.dev",
+    ]);
+  });
+
+  it("replays resets once with stable ids and leaves unrelated replies as comments", () => {
+    const threads = [5, 0, 5].map((vote, index) =>
+      voteThread({ id: index + 2, vote, voterId: JANE_ID, voterName: "Jane" }),
+    );
+    const first = threads[0];
+    if (first === undefined) throw new Error("expected a vote thread");
+    const payload = asJson({
+      value: [
+        ...threads,
+        {
+          ...first,
+          id: 5,
+          comments: [
+            { ...first.comments[0], content: "Unknown voter." },
+            { id: 2, content: "Thanks.", publishedDate: "2026-07-06T00:00:00Z" },
+          ],
+          properties: {
+            CodeReviewThreadType: { $value: "VoteUpdate" },
+            CodeReviewVoteResult: { $value: "10" },
+          },
+        },
+      ],
+    });
+    const comments = expectSuccess(decodeThreadsJson(payload, reviewersById()));
+    expect(expectSuccess(decodeThreadsJson(payload, reviewersById()))).toEqual(comments);
+    expect(comments.map((comment) => [comment.id, comment.reviewState])).toEqual([
+      ["2:1", "APPROVED"],
+      ["3:1", "DISMISSED"],
+      ["4:1", "APPROVED"],
+      ["5:1", "APPROVED"],
+      ["5:2", null],
+    ]);
+    expect(comments[3]?.author).toBeNull();
+    expect(comments[4]?.kind).toBe("issue-comment");
+  });
+
+  it.each([null, "", " ", "not a vote", "20", "-20"])(
+    "does not infer a vote from prose when its value is %s",
+    (vote) => {
+      const thread = voteThread({ id: 2, vote, voterId: JANE_ID, voterName: "Jane" });
+      const comments = expectSuccess(
+        decodeThreadsJson(
+          asJson({
+            value: [
+              {
+                ...thread,
+                comments: [
+                  { ...thread.comments[0], content: "Jane approved the pull request." },
+                  { id: 2, content: "Ordinary reply.", publishedDate: "2026-07-03T00:00:00Z" },
+                ],
+              },
+            ],
+          }),
+          reviewersById(),
+        ),
+      );
+      expect(comments).toMatchObject([{ id: "2:2", kind: "issue-comment", reviewState: null }]);
+    },
+  );
 });
 
 describe("decodeIterationsJson", () => {
