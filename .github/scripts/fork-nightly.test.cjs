@@ -22,6 +22,23 @@ const nightly = (overrides = {}) => ({
   ...overrides,
 });
 
+test("fingerprint checks isolate non-base edits and retain the fork runner", () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, "../workflows/mobile-fingerprint-check.yml"),
+    "utf8",
+  );
+  assert.match(workflow, /types: \[opened, synchronize, reopened, edited\]/);
+  assert.match(
+    workflow,
+    /group: mobile-fingerprint-check-\$\{\{ github\.event\.action == 'edited' && !github\.event\.changes\.base && format\('edit-\{0\}', github\.run_id\) \|\| github\.event\.pull_request\.number \}\}/,
+  );
+  assert.match(workflow, /if: github\.event\.action != 'edited' \|\| github\.event\.changes\.base/);
+  assert.match(
+    workflow,
+    /runs-on: \$\{\{ github\.repository == 'amv146\/t3code' && 'ubuntu-24\.04' \|\| 'blacksmith-8vcpu-ubuntu-2404' \}\}/,
+  );
+});
+
 test("selects the last published nightly, excluding draft, preview, and stable releases", () => {
   const latest = nightly();
   assert.equal(
