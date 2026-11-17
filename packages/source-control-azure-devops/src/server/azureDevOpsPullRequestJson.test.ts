@@ -583,7 +583,11 @@ describe("decodeThreadsJson", () => {
           ...first,
           id: 5,
           comments: [
-            { ...first.comments[0], content: "Unknown voter." },
+            {
+              ...first.comments[0],
+              content: "Unknown voter.",
+              publishedDate: "2026-07-05T00:00:00Z",
+            },
             { id: 2, content: "Thanks.", publishedDate: "2026-07-06T00:00:00Z" },
           ],
           properties: {
