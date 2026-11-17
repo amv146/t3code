@@ -94,6 +94,11 @@ describe("labels and reference links", () => {
         },
       ]);
     }
+    expect(collectComposerContextReferences(`[${reference}]`)[0]).toMatchObject({
+      label: "#30296",
+      source: reference,
+      start: 1,
+    });
   });
 
   it("recognizes a prompt made only of image references", () => {
