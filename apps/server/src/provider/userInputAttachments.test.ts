@@ -278,6 +278,15 @@ describe("question answer paths", () => {
 
   it.effect.each([
     [
+      "page-specific headers and footers",
+      String.raw`{\rtf1\ansi\facingp\sectd\titlepg
+{\headerf First-page header}{\headerl Left-page header}{\headerr Right-page header}
+{\footerf First-page footer}{\footerl Left-page footer}{\footerr Right-page footer}
+\pard Approved delivery date: 24 November.\par
+}`,
+      "Approved delivery date: 24 November.",
+    ],
+    [
       "text symbols",
       String.raw`{\rtf1\ansi Pages 1\endash 5\emdash\lquote left\rquote\ldblquote right\rdblquote\bullet\b End\b0\unknown{\*\secret\bullet hidden}}`,
       "Pages 1–5—‘left’“right”•End",
@@ -310,7 +319,7 @@ describe("question answer paths", () => {
     ["large fallback", String.raw`{\rtf1\ansi\uc20\u945????????????????????Z}`, "αZ"],
     ["no fallback", String.raw`{\rtf1\ansi\uc0\u945Z}`, "αZ"],
     ["scoped count", String.raw`{\rtf1\ansi{\uc2\u945??}\u946?Z}`, "αβZ"],
-  ] as const)("extracts RTF symbols and Unicode fallbacks: %s", ([name, source, expected]) =>
+  ] as const)("extracts RTF text: %s", ([name, source, expected]) =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;
       const path = NodePath.join(config.attachmentsDir, `${name}.rtf`);
@@ -676,7 +685,7 @@ describe("question answer paths", () => {
             ext === "pptx"
               ? {
                   "ppt/presentation.xml":
-                    '<presentation><sldId r:id="bad"/><sldId r:id="good"/></presentation>',
+                    '<presentation><sldIdLst><sldId r:id="bad"/><sldId r:id="good"/></sldIdLst></presentation>',
                   "ppt/_rels/presentation.xml.rels":
                     '<Relationships><Relationship Id="bad" Target="bad.xml"/><Relationship Id="good" Target="good.xml"/></Relationships>',
                   "ppt/bad.xml": "<slide><p>Discard</slide>",
@@ -903,8 +912,16 @@ describe("question answer paths", () => {
           ext: "pptx",
           bounded: true,
           parts: {
-            "ppt/presentation.xml":
-              '<p:presentation><p:sldIdLst><p:sldId id="1" r:id="b"/><p:sldId id="2" r:id="a"/></p:sldIdLst></p:presentation>',
+            "ppt/presentation.xml": `<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+              xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+              xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main">
+              <p:sldIdLst><p:sldId id="256" r:id="b"/><p:sldId id="257" r:id="a"/></p:sldIdLst>
+              <p:extLst><p:ext uri="{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"><p14:sectionLst>
+                <p14:section name="Schedule" id="{01F07B81-39E6-4BBB-9B89-66EA253FBD29}">
+                  <p14:sldIdLst><p14:sldId id="256"/><p14:sldId id="257"/></p14:sldIdLst>
+                </p14:section>
+              </p14:sectionLst></p:ext></p:extLst>
+            </p:presentation>`,
             "ppt/_rels/presentation.xml.rels":
               '<Relationships><Relationship Id="a" Target="slides/slide1.xml"/><Relationship Id="b" Target="slides/slide2.xml"/></Relationships>',
             "ppt/slides/slide1.xml": "<p:sld><a:p><a:r><a:t>Departure</a:t></a:r></a:p></p:sld>",
@@ -925,13 +942,15 @@ describe("question answer paths", () => {
             "## Slide 2",
             "Departure\nNotes:\nBoard at gate 4",
           ],
+          occurrences: { text: "## Slide ", count: 2 },
           absent: ["Unrelated notes", "[Skipped document part", "[Extracted text truncated"],
         },
         ...[false, true].map((missing) => ({
           ext: "pptx",
           bounded: true,
           parts: {
-            "ppt/presentation.xml": '<presentation><sldId r:id="a"/></presentation>',
+            "ppt/presentation.xml":
+              '<presentation><sldIdLst><sldId r:id="a"/></sldIdLst></presentation>',
             "ppt/_rels/presentation.xml.rels":
               '<Relationships><Relationship Id="a" Target="slides/a.xml"/></Relationships>',
             "ppt/slides/a.xml": "<slide><p>Slide text</p></slide>",
@@ -949,7 +968,7 @@ describe("question answer paths", () => {
           bounded: true,
           parts: {
             "ppt/presentation.xml":
-              '<presentation><sldId r:id="a"/><sldId r:id="b"/></presentation>',
+              '<presentation><sldIdLst><sldId r:id="a"/><sldId r:id="b"/></sldIdLst></presentation>',
             "ppt/_rels/presentation.xml.rels":
               '<Relationships><Relationship Id="a" Target="slides/a.xml"/><Relationship Id="b" Target="slides/b.xml"/></Relationships>',
             "ppt/slides/a.xml": `<slide><p>${"A".repeat(600_000)}</p></slide>`,
@@ -1083,7 +1102,7 @@ describe("question answer paths", () => {
           bounded: true,
           parts: {
             "ppt/presentation.xml":
-              '<p:presentation><p:sldId r:id="a"/><p:sldId r:id="missing"/></p:presentation>',
+              '<p:presentation><p:sldIdLst><p:sldId r:id="a"/><p:sldId r:id="missing"/></p:sldIdLst></p:presentation>',
             "ppt/_rels/presentation.xml.rels":
               '<Relationships><Relationship Id="a" Target="slides/slide.xml"/></Relationships>',
             "ppt/slides/slide.xml": `<p:sld><a:p><a:t>${"A".repeat(1_000_100)}</a:t></a:p></p:sld>`,
