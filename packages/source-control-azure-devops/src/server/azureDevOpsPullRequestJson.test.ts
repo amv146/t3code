@@ -428,6 +428,7 @@ describe("decodeThreadsJson", () => {
         kind: "review",
         reviewState,
         author: { login: "jane@acme.dev" },
+        body: "",
         createdAt: "2026-07-02T00:00:00Z",
         path: null,
       },

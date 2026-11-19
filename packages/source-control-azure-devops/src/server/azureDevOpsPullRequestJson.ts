@@ -515,7 +515,8 @@ export function decodeThreadsJson(
         id: `${thread.id}:${comment.id ?? 0}`,
         kind: reviewState !== null ? "review" : path === null ? "issue-comment" : "review-comment",
         author: reviewState === null ? toActor(comment.author) : voter,
-        body: comment.content ?? "",
+        // A vote's system text ("Jane voted 10") is localized prose; the review state already says it.
+        body: reviewState === null ? (comment.content ?? "") : "",
         createdAt: publishedDate,
         url: null,
         path: reviewState === null ? path : null,
