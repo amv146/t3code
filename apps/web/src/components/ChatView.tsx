@@ -2729,9 +2729,12 @@ export default function ChatView(props: ChatViewProps) {
       return next;
     });
   };
-  // While a question or approval owns the composer, its text answers that, not the agent.
+  // While a question, approval or queued edit owns the composer, its text belongs to that, not the next send.
   const freshSessionCommandAvailable =
-    freshSessionAvailable && activePendingApproval === null && pendingUserInputs.length === 0;
+    freshSessionAvailable &&
+    activePendingApproval === null &&
+    pendingUserInputs.length === 0 &&
+    !queuedRunEdit.isEditing;
   const composerDraftTargetKey = composerTargetKey(composerDraftTarget);
   const composerSendHeld = useComposerSendHeld(composerDraftTargetKey);
   const cancelHeldSendStable = useStableCallback(() => {
@@ -3537,6 +3540,10 @@ export default function ChatView(props: ChatViewProps) {
     onToggleThreadPanel: toggleThreadPanelStable,
     onToggleRightPanel: toggleRightPanelStable,
   } satisfies PanelLayoutControlsProps;
+  const rightPanelMaximizeShortcutLabel = shortcutLabelForCommand(
+    keybindings,
+    "rightPanel.toggleMaximized",
+  );
   const panelToggleControls = (
     <PanelLayoutControls
       {...panelToggleControlProps}
@@ -3551,6 +3558,7 @@ export default function ChatView(props: ChatViewProps) {
       animationsActive={panelAnimationsActive}
       maximized={rightPanelMaximized}
       onToggleMaximized={toggleRightPanelMaximizedStable}
+      maximizeShortcutLabel={rightPanelMaximizeShortcutLabel}
     >
       {panelToggleControls}
     </WorkspaceTitlebarControls>
@@ -4039,6 +4047,10 @@ export default function ChatView(props: ChatViewProps) {
                                 onRestoreEditingQueuedAttachment={
                                   queuedRunEdit.restoreEditingAttachment
                                 }
+                                canMoveEditingQueuedMessageToStash={
+                                  queuedRunEdit.canMoveEditToStash
+                                }
+                                onMoveEditingQueuedMessageToStash={queuedRunEdit.removeEditedRun}
                               />
                             )}
                           </div>
@@ -4273,6 +4285,7 @@ export default function ChatView(props: ChatViewProps) {
                 <RightPanelMaximizeControl
                   maximized={rightPanelMaximized}
                   onToggle={toggleRightPanelMaximizedStable}
+                  shortcutLabel={rightPanelMaximizeShortcutLabel}
                 />
                 {panelToggleControls}
               </div>
